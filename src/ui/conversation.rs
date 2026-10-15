@@ -1074,9 +1074,6 @@ fn emoji_suggestions(app: &mut App, ui: &mut egui::Ui, field: egui::Id) {
         return;
     };
     let start = app.emoji_start.expect("checked above");
-    if query.chars().count() < 2 {
-        return;
-    }
     let candidates = emoji_candidates(app, query);
     if candidates.is_empty() {
         return;
