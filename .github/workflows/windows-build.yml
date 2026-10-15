@@ -1,0 +1,29 @@
+name: Windows build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build (Windows x64)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: jdx/mr-boxington-action@v1
+        with:
+          cache-generation: windows-build-v1
+      - run: mbx build --locked --release
+      - uses: actions/upload-artifact@v7
+        with:
+          name: zapfast-windows-x64
+          path: target/release/zapfast.exe
