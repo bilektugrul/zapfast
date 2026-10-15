@@ -1082,13 +1082,24 @@ fn emoji_suggestions(app: &mut App, ui: &mut egui::Ui, field: egui::Id) {
     let down = take_plain_key(ui, Key::ArrowDown);
     let up = take_plain_key(ui, Key::ArrowUp);
     if down {
-        app.emoji_selected = (app.emoji_selected + 1) % candidates.len();
+        app.emoji_selected = if app.emoji_chosen {
+            (app.emoji_selected + 1) % candidates.len()
+        } else {
+            0
+        };
+        app.emoji_chosen = true;
     }
     if up {
-        app.emoji_selected = (app.emoji_selected + candidates.len() - 1) % candidates.len();
+        app.emoji_selected = if app.emoji_chosen {
+            (app.emoji_selected + candidates.len() - 1) % candidates.len()
+        } else {
+            candidates.len() - 1
+        };
+        app.emoji_chosen = true;
     }
     app.emoji_selected = app.emoji_selected.min(candidates.len() - 1);
-    let submit = take_plain_key(ui, Key::Enter) || take_plain_key(ui, Key::Tab);
+    let submit =
+        (app.emoji_chosen && take_plain_key(ui, Key::Enter)) || take_plain_key(ui, Key::Tab);
     let mut picked = submit.then(|| candidates[app.emoji_selected].clone());
     let palette = app.palette;
 
@@ -1098,7 +1109,7 @@ fn emoji_suggestions(app: &mut App, ui: &mut egui::Ui, field: egui::Id) {
         for (index, candidate) in candidates.iter().enumerate() {
             let (rect, response) =
                 ui.allocate_exact_size(vec2(ui.available_width(), row_height), Sense::click());
-            if index == app.emoji_selected {
+            if app.emoji_chosen && index == app.emoji_selected {
                 ui.painter().rect_filled(
                     rect,
                     SUGGESTION_ROW_RADIUS,
@@ -1744,6 +1755,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                         app.picker = None;
                                         app.emoji_start = Some(at);
                                         app.emoji_selected = 0;
+                                        app.emoji_chosen = false;
                                         app.mention_start = None;
                                     } else if typed_at
                                         && chat.is_group()
@@ -1759,6 +1771,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                                         app.mention_selected = 0;
                                     } else if app.emoji_start.is_some() {
                                         app.emoji_selected = 0;
+                                        app.emoji_chosen = false;
                                     }
                                 }
                                 let cursor = output

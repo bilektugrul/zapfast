@@ -413,6 +413,8 @@ pub struct App {
     pub emoji_start: Option<usize>,
     /// Keyboard-highlighted emoji in suggestions or the full picker.
     pub emoji_selected: usize,
+    /// Whether the arrow keys picked an emoji suggestion for Enter.
+    pub emoji_chosen: bool,
     /// Byte offset of the `@` starting the active mention query.
     pub mention_start: Option<usize>,
     /// Keyboard-highlighted member in the mention suggestions.
@@ -1298,6 +1300,7 @@ impl App {
             composer_mentions: Vec::new(),
             emoji_start: None,
             emoji_selected: 0,
+            emoji_chosen: false,
             mention_start: None,
             mention_selected: 0,
             reply_to: None,

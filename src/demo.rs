@@ -9267,7 +9267,14 @@ mod tests {
         frame_with(&mut app, &ctx, vec![egui::Event::Text("gri".into())]);
         render(&mut app, &ctx);
         assert_eq!(app.composer, ":gri");
-        assert_eq!(app.emoji_selected, 0, "a new query selects its first match");
+        assert!(!app.emoji_chosen);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::ArrowDown, egui::Modifiers::NONE)],
+        );
+        assert_eq!(app.emoji_selected, 0);
+        assert!(app.emoji_chosen);
         frame_with(
             &mut app,
             &ctx,
@@ -9286,6 +9293,25 @@ mod tests {
         assert_eq!(app.picker, None);
         assert_eq!(app.settings.recent_emoji.first(), Some(&app.composer));
         assert!(ctx.memory(|memory| memory.has_focus(egui::Id::new("composer-text"))));
+    }
+
+    #[test]
+    fn enter_sends_the_text_until_an_emoji_is_chosen() {
+        let mut app = app();
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        render(&mut app, &ctx);
+
+        frame_with(&mut app, &ctx, vec![egui::Event::Text(":".into())]);
+        frame_with(&mut app, &ctx, vec![egui::Event::Text("D".into())]);
+        render(&mut app, &ctx);
+        frame_with(
+            &mut app,
+            &ctx,
+            vec![key(egui::Key::Enter, egui::Modifiers::NONE)],
+        );
+
+        assert!(app.composer.is_empty(), "Enter sends the literal text");
     }
 
     #[test]
