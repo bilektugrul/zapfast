@@ -34,6 +34,10 @@ const LEAD: Duration = Duration::from_millis(400);
 const UNSEEN: Duration = Duration::from_millis(1500);
 /// Longest wait between repaints while a video plays, for the progress.
 const TICK: Duration = Duration::from_millis(40);
+/// How long a video plays silently after its sound output failed before the
+/// sound is opened again, doubling up to the longest with each failure.
+const SOUND_RETRY: Duration = Duration::from_secs(1);
+const SOUND_RETRY_LONGEST: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum State {
@@ -196,7 +200,7 @@ pub fn arc(center: egui::Pos2, radius: f32, fraction: f32) -> Vec<egui::Pos2> {
 
 /// The sound of the playing video on the default output device.
 struct Sound {
-    device: rodio::MixerDeviceSink,
+    device: crate::audio::Output,
     sink: rodio::Player,
     /// Video time the queued sound starts from.
     base: Duration,
@@ -269,7 +273,7 @@ impl Sound {
     /// track, or a computer without an output device, plays silently.
     fn open(path: &Path, from: Duration, muted: bool, speed: f32) -> Option<Self> {
         let decoder = sound_decoder(path, from)?;
-        let device = match crate::audio::open_output() {
+        let device = match crate::audio::open_output(crate::audio::Health::new("video sound")) {
             Ok(device) => device,
             Err(error) => {
                 log::warn!("video plays without sound: {error}");
@@ -562,6 +566,9 @@ struct Session {
     texture: Option<TextureHandle>,
     clock: Clock,
     sound: Option<Sound>,
+    /// When to open the sound again after its output failed (#507), and how
+    /// long the wait after the next failure will be.
+    sound_retry: Option<(Instant, Duration)>,
     total: Duration,
     /// Longest side of the frames the decoder in use sends.
     side: u32,
@@ -604,6 +611,40 @@ impl Session {
             }
             State::Playing => {}
         }
+    }
+
+    /// Drops a sound whose output keeps failing (#507), and opens it again at
+    /// the clock's position after a wait that doubles with each failure, so
+    /// the video plays on silently in between.
+    fn recover_sound(&mut self, now: Instant, muted: bool, speed: f32) {
+        if self
+            .sound
+            .as_ref()
+            .is_some_and(|sound| sound.device.failed())
+        {
+            self.sound = None;
+            self.retry_sound(now);
+        }
+        let Some((at, _)) = self.sound_retry else {
+            return;
+        };
+        if self.sound.is_some() || now < at {
+            return;
+        }
+        self.sound = Sound::open(&self.path, self.clock.position(now), muted, speed);
+        match &self.sound {
+            Some(sound) if self.state == State::Playing => sound.sink.play(),
+            Some(_) => {}
+            None => self.retry_sound(now),
+        }
+    }
+
+    fn retry_sound(&mut self, now: Instant) {
+        let wait = self
+            .sound_retry
+            .map_or(SOUND_RETRY, |(_, wait)| (wait * 2).min(SOUND_RETRY_LONGEST));
+        log::warn!("video sound lost; trying again in {wait:?}");
+        self.sound_retry = Some((now + wait, wait));
     }
 
     fn show(&mut self, ctx: &egui::Context, image: ColorImage) {
@@ -880,6 +921,7 @@ impl Player {
                 .audible
                 .then(|| Sound::open(path, from, self.muted, self.speed))
                 .flatten(),
+            sound_retry: None,
             total: Duration::ZERO,
             side: self.side,
             resize: None,
@@ -951,6 +993,7 @@ impl Player {
                 return None;
             }
         }
+        session.recover_sound(now, self.muted, self.speed);
         if session.state != State::Playing {
             return None;
         }

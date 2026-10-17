@@ -331,7 +331,7 @@ fn chosen_available(
 /// The pump, the fallback rules and the framing above stay exactly as they are whichever this is,
 /// so what a test covers is the real behaviour rather than a second implementation of it.
 enum Mic {
-    Real(rodio::microphone::Microphone),
+    Real(rodio::microphone::Microphone, crate::audio::Health),
     /// Installed only by a test, and only while its guard lives.
     #[cfg(test)]
     Fake(fake::Microphone),
@@ -340,7 +340,7 @@ enum Mic {
 impl Mic {
     fn channels(&self) -> u16 {
         match self {
-            Mic::Real(microphone) => microphone.channels().get(),
+            Mic::Real(microphone, _) => microphone.channels().get(),
             #[cfg(test)]
             Mic::Fake(microphone) => microphone.channels,
         }
@@ -348,15 +348,24 @@ impl Mic {
 
     fn rate(&self) -> u32 {
         match self {
-            Mic::Real(microphone) => microphone.sample_rate().get(),
+            Mic::Real(microphone, _) => microphone.sample_rate().get(),
             #[cfg(test)]
             Mic::Fake(microphone) => microphone.rate,
         }
     }
 
+    /// Whether the stream keeps failing (#507), so the reader reopens it.
+    fn failed(&self) -> bool {
+        match self {
+            Mic::Real(_, health) => health.failed(),
+            #[cfg(test)]
+            Mic::Fake(_) => false,
+        }
+    }
+
     fn next(&mut self) -> Option<f32> {
         match self {
-            Mic::Real(microphone) => microphone.next(),
+            Mic::Real(microphone, _) => microphone.next(),
             #[cfg(test)]
             Mic::Fake(microphone) => microphone.next(),
         }
@@ -368,7 +377,9 @@ fn open_microphone(device: Option<&str>) -> Result<Mic, String> {
     if let Some(microphone) = fake::open_microphone(device) {
         return Ok(Mic::Fake(microphone));
     }
-    let builder = rodio::microphone::MicrophoneBuilder::new();
+    let health = crate::audio::Health::new("call microphone");
+    let builder =
+        rodio::microphone::MicrophoneBuilder::new().with_error_callback(health.callback());
     let builder = match device {
         Some(name) => {
             let input = rodio::microphone::available_inputs()
@@ -388,7 +399,7 @@ fn open_microphone(device: Option<&str>) -> Result<Mic, String> {
         .default_config()
         .map_err(|error| format!("the microphone has no supported format: {error}"))?
         .open_stream()
-        .map(Mic::Real)
+        .map(|microphone| Mic::Real(microphone, health))
         .map_err(|error| format!("the microphone could not be opened: {error}"))
 }
 
@@ -396,6 +407,7 @@ fn open_microphone(device: Option<&str>) -> Result<Mic, String> {
 enum Sink {
     Real {
         _device: rodio::MixerDeviceSink,
+        health: crate::audio::Health,
         player: rodio::Player,
         layout: Layout,
     },
@@ -409,6 +421,7 @@ fn open_sink(device: Option<&str>) -> Result<Sink, String> {
     if let Some(speaker) = fake::open_speaker(device) {
         return Ok(Sink::Fake(speaker));
     }
+    let health = crate::audio::Health::new("call speaker");
     let sink = match device {
         Some(name) => {
             let output = rodio::cpal::default_host()
@@ -423,25 +436,34 @@ fn open_sink(device: Option<&str>) -> Result<Sink, String> {
                 .ok_or_else(|| format!("the speaker {name} is not available"))?;
             rodio::DeviceSinkBuilder::from_device(output)
                 .map_err(|error| format!("the speaker {name} could not be used: {error}"))?
+                .with_error_callback(health.callback())
                 .open_stream()
                 .map_err(|error| format!("the speaker {name} could not be opened: {error}"))?
         }
-        None => rodio::DeviceSinkBuilder::open_default_sink()
-            .map_err(|error| format!("no speaker is available: {error}"))?,
+        None => crate::audio::open_output(health.clone())
+            .map_err(|error| format!("no speaker is available: {error}"))?
+            .into_sink(),
     };
-    let layout = Layout {
-        rate: sink.config().sample_rate().get(),
-        channels: sink.config().channel_count().get(),
-    };
-    let player = rodio::Player::connect_new(sink.mixer());
-    Ok(Sink::Real {
-        _device: sink,
-        player,
-        layout,
-    })
+    Ok(Sink::real(sink, health))
 }
 
 impl Sink {
+    fn real(mut sink: rodio::MixerDeviceSink, health: crate::audio::Health) -> Self {
+        // Its drop notice goes to stderr, which may be closed (see `audio::open_output`).
+        sink.log_on_drop(false);
+        let layout = Layout {
+            rate: sink.config().sample_rate().get(),
+            channels: sink.config().channel_count().get(),
+        };
+        let player = rodio::Player::connect_new(sink.mixer());
+        Sink::Real {
+            _device: sink,
+            health,
+            player,
+            layout,
+        }
+    }
+
     /// The rate and channel count this device wants, which the engine's frames are converted to.
     fn layout(&self) -> Layout {
         match self {
@@ -473,6 +495,15 @@ impl Sink {
             Sink::Real { player, .. } => player.get_pos(),
             #[cfg(test)]
             Sink::Fake(speaker) => speaker.position(),
+        }
+    }
+
+    /// Whether the stream keeps failing (#507), so the writer reopens it.
+    fn failed(&self) -> bool {
+        match self {
+            Sink::Real { health, .. } => health.failed(),
+            #[cfg(test)]
+            Sink::Fake(speaker) => speaker.failed(),
         }
     }
 
@@ -695,6 +726,14 @@ fn read_microphone(
     let mut block = vec![0.0_f32; converter.block()];
     let mut frames = Vec::new();
     while !stop.load(Ordering::Relaxed) {
+        if microphone.failed() {
+            // The pump opens another once this returns; the wait keeps a device that fails every
+            // stream from being reopened in a loop.
+            log::warn!("[CALL] the microphone stream keeps failing; reopening it");
+            drop(microphone);
+            std::thread::sleep(RETRY);
+            return;
+        }
         for slot in &mut block {
             match microphone.next() {
                 Some(sample) => *slot = sample,
@@ -1099,6 +1138,12 @@ fn write_speaker(
         }
         sink.append(sink.layout().convert(&frame));
         accepted.store(true, Ordering::Relaxed);
+        if sink.failed() {
+            // Reopened the way a stalled stream is.
+            log::warn!("[CALL] the speaker stream keeps failing; reopening it");
+            stalled.store(true, Ordering::Relaxed);
+            return;
+        }
         let position = sink.position();
         if position > last_position {
             // The stream is playing, so from here anything that stops it is a stall rather than a
@@ -1205,9 +1250,24 @@ pub(crate) mod fake {
         /// How long an open is made to take, so a test can hold the pump still while it sends
         /// device selections and prove none of them is dropped.
         pub(crate) open_pause: Arc<AtomicUsize>,
+        /// What the stream opened last reported, which a test feeds the errors of a failing
+        /// stream through. Each open starts a fresh one, as a new stream would.
+        pub(crate) health: Arc<Mutex<crate::audio::Health>>,
     }
 
     impl Speaker {
+        /// The health of the stream opened last.
+        pub(crate) fn health(&self) -> crate::audio::Health {
+            self.health
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .clone()
+        }
+
+        pub(super) fn failed(&self) -> bool {
+            self.health().failed()
+        }
+
         /// Every block the engine has handed over so far, in this device's layout.
         pub(crate) fn written(&self) -> Vec<Vec<f32>> {
             self.written
@@ -1325,6 +1385,7 @@ pub(crate) mod fake {
             played_count: Arc::new(AtomicUsize::new(0)),
             played: Arc::new(Mutex::new(Duration::ZERO)),
             open_pause: Arc::new(AtomicUsize::new(0)),
+            health: Arc::new(Mutex::new(crate::audio::Health::new("test speaker"))),
         };
         *INSTALLED.lock().unwrap_or_else(|error| error.into_inner()) = Some(Installed {
             microphone: Some(Spec {
@@ -1371,6 +1432,10 @@ pub(crate) mod fake {
             .lock()
             .unwrap_or_else(|error| error.into_inner())
             .push(device.map(str::to_owned));
+        *speaker
+            .health
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = crate::audio::Health::new("test speaker");
         Some(speaker)
     }
 }
@@ -1876,6 +1941,41 @@ mod tests {
         );
         // And the restarted stream plays what the engine sends from here on.
         speaker.drains.store(true, Ordering::Relaxed);
+        let before = speaker.played_count();
+        let started = Instant::now();
+        while speaker.played_count() <= before && started.elapsed() < Duration::from_secs(5) {
+            let _ = tx.try_send(frame.clone());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        drop(output);
+        assert!(speaker.played_count() > before, "the call kept playing");
+    }
+
+    /// A stream that floods its error callback, as cpal 0.17's ALSA backend does with POLLERR
+    /// (#507), is reopened, though it never stopped draining, and the call plays on.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failing_speaker_stream_is_reopened() {
+        let (_devices, speaker) = fake::install(vec![0.0; 8], 1, RATE, (48_000, 2));
+        let (output, tx) = AudioOutput::spawn(None);
+        let frame = vec![100_i16; FRAME_SAMPLES];
+        let started = Instant::now();
+        while speaker.played_count() == 0 && started.elapsed() < Duration::from_secs(5) {
+            let _ = tx.try_send(frame.clone());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(speaker.opened_count(), 1);
+        let health = speaker.health();
+        let mut report = health.callback();
+        while !health.failed() {
+            report(crate::audio::health::pollerr());
+        }
+        let started = Instant::now();
+        while speaker.opened_count() < 2 && started.elapsed() < Duration::from_secs(5) {
+            let _ = tx.try_send(frame.clone());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // The fake drains throughout, so nothing but the errors reopened it.
+        assert_eq!(speaker.opened_count(), 2, "the failing stream was reopened");
         let before = speaker.played_count();
         let started = Instant::now();
         while speaker.played_count() <= before && started.elapsed() < Duration::from_secs(5) {

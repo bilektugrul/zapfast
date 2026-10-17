@@ -43,6 +43,12 @@ const RINGTONE_LEVEL: f32 = 0.28;
 const EDGE: f32 = 0.02;
 /// How long a stopped tone takes to fade out.
 const FADE_OUT: Duration = Duration::from_millis(60);
+/// How often a playing tone looks at its output's health.
+const WATCH: Duration = Duration::from_millis(100);
+/// How long a tone whose output failed waits before opening it again,
+/// doubling up to the longest with each failure.
+const RETRY: Duration = Duration::from_secs(1);
+const RETRY_LONGEST: Duration = Duration::from_secs(30);
 
 /// A tone a call plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -111,30 +117,48 @@ impl Playing {
         let spawned = std::thread::Builder::new()
             .name("call-tone".into())
             .spawn(move || {
-                let device = match crate::audio::open_output() {
-                    Ok(device) => device,
-                    Err(error) => {
-                        log::debug!("call tone not played: {error}");
-                        return;
+                let mut retry = RETRY;
+                loop {
+                    let health = crate::audio::Health::new("call tone");
+                    let device = match crate::audio::open_output(health) {
+                        Ok(device) => device,
+                        Err(error) => {
+                            log::debug!("call tone not played: {error}");
+                            return;
+                        }
+                    };
+                    let player = rodio::Player::connect_new(device.mixer());
+                    player.append(
+                        SamplesBuffer::new(
+                            NonZero::<u16>::MIN,
+                            NonZero::new(RATE).expect("48 kHz is not zero"),
+                            cycle(tone),
+                        )
+                        .repeat_infinite(),
+                    );
+                    // Runs until the handle is dropped, which closes the channel, or until the
+                    // output keeps failing (#507): then the device is let go, and opened again
+                    // after a wait that doubles each time.
+                    if !wait_for_stop(&stopped, || device.failed(), WATCH) {
+                        drop(player);
+                        drop(device);
+                        if !matches!(
+                            stopped.recv_timeout(retry),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+                        ) {
+                            return;
+                        }
+                        retry = (retry * 2).min(RETRY_LONGEST);
+                        continue;
                     }
-                };
-                let player = rodio::Player::connect_new(device.mixer());
-                player.append(
-                    SamplesBuffer::new(
-                        NonZero::<u16>::MIN,
-                        NonZero::new(RATE).expect("48 kHz is not zero"),
-                        cycle(tone),
-                    )
-                    .repeat_infinite(),
-                );
-                // Runs until the handle is dropped, which closes the channel.
-                let _ = stopped.recv();
-                const STEPS: u32 = 6;
-                for step in (0..STEPS).rev() {
-                    player.set_volume(step as f32 / STEPS as f32);
-                    std::thread::sleep(FADE_OUT / STEPS);
+                    const STEPS: u32 = 6;
+                    for step in (0..STEPS).rev() {
+                        player.set_volume(step as f32 / STEPS as f32);
+                        std::thread::sleep(FADE_OUT / STEPS);
+                    }
+                    player.stop();
+                    return;
                 }
-                player.stop();
             });
         match spawned {
             Ok(_) => Some(Self { _stop: stop }),
@@ -142,6 +166,23 @@ impl Playing {
                 log::debug!("no thread for a call tone: {error}");
                 None
             }
+        }
+    }
+}
+
+/// Waits until the tone's handle is dropped, which returns true, or until
+/// `failed`, looked at every `every`, which returns false.
+fn wait_for_stop(
+    stopped: &std::sync::mpsc::Receiver<()>,
+    failed: impl Fn() -> bool,
+    every: Duration,
+) -> bool {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match stopped.recv_timeout(every) {
+            Err(RecvTimeoutError::Timeout) if failed() => return false,
+            Err(RecvTimeoutError::Timeout) => {}
+            Ok(()) | Err(RecvTimeoutError::Disconnected) => return true,
         }
     }
 }

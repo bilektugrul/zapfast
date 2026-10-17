@@ -23,6 +23,18 @@ use crate::calls::{CallPhase, CallUpdate};
 use crate::model::{AccountId, Action, CallDirection, Chat, ChatId};
 use crate::settings::NotificationSound;
 
+/// One person on a group call, as the call screen draws them.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CallPerson {
+    pub id: String,
+    pub name: String,
+    pub picture: Option<std::path::PathBuf>,
+    /// Whether the call service counts them as in the call, not only asked.
+    pub joined: bool,
+    /// Whether their camera's picture is arriving.
+    pub video: bool,
+}
+
 /// How long a call may stay placing with no word from its worker before the
 /// screen gives up on it. Placing waits on device checks, the camera (whose
 /// first use on macOS asks permission) and the peer's devices, so this is
@@ -88,22 +100,84 @@ impl App {
         locked && !(on_screen && self.locked_folder_open())
     }
 
-    /// The name the call shows for the other side: the chat's own title, or
-    /// "Locked chat" while the lock hides it.
+    /// The name the call shows for the other side: the chat's own title (a
+    /// group's subject for a group call), or "Locked chat" while the lock
+    /// hides it.
     pub fn call_name(&mut self) -> String {
-        let Some(chat) = self.call.as_ref().map(|call| call.chat.clone()) else {
+        let Some(call) = self.call.as_ref() else {
             return String::new();
         };
+        // A call joined through a link belongs to no chat.
+        if call.group.as_ref().is_some_and(|group| group.link) {
+            return crate::i18n::gettext(self.locale, "Call link").into_owned();
+        }
+        let chat = call.chat.clone();
         if self.call_is_private() {
             return crate::i18n::gettext(self.locale, "Locked chat").into_owned();
         }
-        self.with_call_account(|app| app.display_name(&chat))
+        self.with_call_account(|app| app.chat_title_of(&chat))
+    }
+
+    /// Who rang a group call, by name: `None` for a one-to-one call, whose
+    /// chat already says who, and while the lock hides the chat.
+    pub fn call_caller_name(&mut self) -> Option<String> {
+        let caller = self.call.as_ref()?.group.as_ref()?.caller.clone()?;
+        if self.call_is_private() {
+            return None;
+        }
+        Some(self.with_call_account(|app| app.display_name(&caller)))
+    }
+
+    /// Ourselves on a group call, as our own tile shows us: our photo under
+    /// "You". `None` on a one-to-one call.
+    pub fn call_self(&mut self) -> Option<CallPerson> {
+        self.call.as_ref()?.group.as_ref()?;
+        let you = crate::i18n::gettext(self.locale, "You").into_owned();
+        self.with_call_account(|app| {
+            let id = app.me.clone().unwrap_or_default();
+            Some(CallPerson {
+                picture: (!id.is_empty()).then(|| app.avatar(&id)).flatten(),
+                name: you,
+                id,
+                joined: true,
+                video: false,
+            })
+        })
+    }
+
+    /// The people on a group call, named and pictured by the call's own
+    /// account. Nobody while the lock hides the chat: a member's name says as
+    /// much about the chat as its own does.
+    pub fn call_people(&mut self) -> Vec<CallPerson> {
+        let Some(group) = self.call.as_ref().and_then(|call| call.group.clone()) else {
+            return Vec::new();
+        };
+        if self.call_is_private() {
+            return Vec::new();
+        }
+        self.with_call_account(|app| {
+            group
+                .participants
+                .into_iter()
+                .map(|person| CallPerson {
+                    name: app.display_name(&person.id),
+                    picture: app.avatar(&person.id),
+                    joined: person.joined,
+                    video: person.video,
+                    id: person.id,
+                })
+                .collect()
+        })
     }
 
     /// The picture the call shows for the other side: none while the chat is
     /// locked, because a photo is the same disclosure the name is.
     pub fn call_avatar(&mut self) -> Option<std::path::PathBuf> {
-        let chat = self.call.as_ref()?.chat.clone();
+        let call = self.call.as_ref()?;
+        if call.chat.is_empty() {
+            return None;
+        }
+        let chat = call.chat.clone();
         if self.call_is_private() {
             return None;
         }
@@ -152,6 +226,8 @@ impl App {
         self.call_remote_frame = None;
         self.call_local_texture = None;
         self.call_remote_texture = None;
+        self.call_member_frames.clear();
+        self.call_member_textures.clear();
     }
 
     /// A video call's newest pictures, from the account the call is on.
@@ -159,6 +235,7 @@ impl App {
         &mut self,
         local: Option<std::sync::Arc<egui::ColorImage>>,
         remote: Option<std::sync::Arc<egui::ColorImage>>,
+        from: Option<String>,
     ) {
         if self.call_account.as_ref() != Some(&self.account().id) || !self.call_live() {
             return;
@@ -166,8 +243,12 @@ impl App {
         if let Some(image) = local {
             self.call_local_frame = Some(image);
         }
-        if let Some(image) = remote {
-            self.call_remote_frame = Some(image);
+        match (remote, from) {
+            (Some(image), Some(member)) => {
+                self.call_member_frames.insert(member, image);
+            }
+            (Some(image), None) => self.call_remote_frame = Some(image),
+            (None, _) => {}
         }
     }
 
@@ -240,6 +321,18 @@ impl App {
         if !update.camera_on || other_account {
             self.call_local_frame = None;
         }
+        // Likewise a member whose video stopped, or who left: their tile goes back to their photo.
+        let sending: Vec<&str> = update
+            .group
+            .iter()
+            .flat_map(|group| &group.participants)
+            .filter(|person| person.video && !other_account)
+            .map(|person| person.id.as_str())
+            .collect();
+        self.call_member_frames
+            .retain(|member, _| sending.contains(&member.as_str()));
+        self.call_member_textures
+            .retain(|member, _| sending.contains(&member.as_str()));
         self.call = Some(update);
         self.call_account = Some(account);
         if finished {
@@ -286,6 +379,34 @@ impl App {
             cancel: Arc::clone(&cancel),
         });
         self.handle_call_update(CallUpdate::placing(generation, chat.to_string(), video));
+        self.call_cancel = Some(cancel);
+        self.call_placed = Some(Instant::now());
+    }
+
+    /// Joins a call link from a message: drawn as connecting in this same
+    /// frame, as a placed call is, while the worker asks to be let in.
+    pub(super) fn join_call_link(&mut self, token: String, video: bool) {
+        if self.call_live() {
+            self.toast_error(crate::i18n::gettext(
+                self.locale,
+                "Hang up the current call first",
+            ));
+            return;
+        }
+        let generation = crate::calls::next_generation();
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.backend.send(Command::JoinCallLink {
+            token,
+            video,
+            generation,
+            cancel: Arc::clone(&cancel),
+        });
+        let mut placing = CallUpdate::placing(generation, String::new(), video);
+        placing.group = Some(crate::calls::GroupCall {
+            link: true,
+            ..crate::calls::GroupCall::default()
+        });
+        self.handle_call_update(placing);
         self.call_cancel = Some(cancel);
         self.call_placed = Some(Instant::now());
     }
@@ -377,13 +498,11 @@ impl App {
                 None,
             )
         } else {
+            // A group call names its group, and in the body who is calling.
+            let caller = self.call_caller_name();
             (
                 self.call_name(),
-                if call.video {
-                    crate::i18n::gettext(self.locale, "Incoming video call").into_owned()
-                } else {
-                    crate::i18n::gettext(self.locale, "Incoming voice call").into_owned()
-                },
+                crate::ui::call::incoming_text(self.locale, &call, caller.as_deref()),
                 self.call_avatar(),
             )
         };
@@ -599,6 +718,7 @@ mod tests {
             microphone: None,
             speaker: None,
             camera: None,
+            group: None,
         }
     }
 
@@ -742,6 +862,72 @@ mod tests {
         // Closing the folder sends the call back behind the strip.
         app.close_locked_folder();
         assert!(app.call_surface_hidden);
+    }
+
+    /// A group member's picture stays on their tile while their video runs, and goes when it
+    /// stops; it never stands in for a one-to-one peer's.
+    #[test]
+    fn a_members_picture_lasts_as_long_as_their_video() {
+        use crate::calls::{GroupCall, Participant};
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = app(directory.path());
+        let with = |video: bool| {
+            let mut update = update(1, CallPhase::Active);
+            update.video = true;
+            update.group = Some(GroupCall {
+                link: false,
+                caller: None,
+                participants: vec![Participant {
+                    id: ADA.to_owned(),
+                    joined: true,
+                    video,
+                }],
+            });
+            update
+        };
+        app.handle_call_update(with(false));
+        let image = Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::BLACK));
+        app.handle_call_video(None, Some(image), Some(ADA.to_owned()));
+        app.handle_call_update(with(true));
+        assert!(app.call_member_frames.contains_key(ADA));
+        assert!(app.call_remote_frame.is_none(), "not a one-to-one picture");
+        assert!(app.call_people()[0].video);
+        app.handle_call_update(with(false));
+        assert!(
+            app.call_member_frames.is_empty(),
+            "a stopped camera leaves no frozen picture"
+        );
+    }
+
+    /// A call link from a message is joined here rather than opened in the browser, and is
+    /// drawn at once under the link's name, with no chat behind it.
+    #[test]
+    fn a_call_link_is_joined_here() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, mut commands) = app(directory.path());
+        let ctx = egui::Context::default();
+        app.apply(
+            Action::OpenUrl("https://call.whatsapp.com/video/AbCdEf1234567890".to_owned()),
+            &ctx,
+        );
+        let sent = sent(&mut commands);
+        assert!(
+            matches!(
+                sent.as_slice(),
+                [Command::JoinCallLink { token, video: true, .. }] if token == "AbCdEf1234567890"
+            ),
+            "{sent:?}"
+        );
+        let call = app.call.clone().expect("on screen at once");
+        assert_eq!(call.phase, CallPhase::Placing);
+        assert_eq!(app.call_name(), "Call link");
+        assert!(app.call_avatar().is_none());
+        // A second link while that call is up is not joined.
+        app.apply(
+            Action::OpenUrl("https://call.whatsapp.com/voice/AbCdEf1234567890".to_owned()),
+            &ctx,
+        );
+        assert!(self::sent(&mut commands).is_empty());
     }
 
     #[test]

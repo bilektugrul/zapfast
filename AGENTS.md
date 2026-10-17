@@ -11,12 +11,13 @@ protocol. These notes are for coding agents and new contributors.
   message content to a third party.
 - Do not copy dependency source into this repository. For a dependency fix,
   use a fork under `github.com/crmne/` pinned to a commit and contribute the
-  fix upstream; egui, winit, whatsapp-rust and rodio already come from such
+  fix upstream; egui, winit and rodio already come from such
   forks. Only the maintainer creates those forks; in a contributor's pull
   request, send the fix upstream and ask for it to be carried. Use the fork
-  until a release includes the fix. Never point a dependency at any other
-  fork or source: `.github/scripts/check-dependency-sources.py` fails CI on
-  one.
+  until a release includes the fix. The maintainer has explicitly approved
+  pinned commits from `github.com/oxidezap/whatsapp-rust` once our carried
+  fixes have merged upstream. Never point a dependency at any other fork
+  or source: `.github/scripts/check-dependency-sources.py` fails CI on one.
 - Screenshots, captures, comparison pages and recordings made for a review
   go in the pull request, never the repository:
   `.github/scripts/check-review-evidence.py` fails CI on any file under
@@ -158,7 +159,36 @@ protocol. These notes are for coding agents and new contributors.
   a stream instead of the call. `backend/worker/calls.rs` owns at most one
   call per account; the window (`app/calls.rs`) holds one call across all
   accounts with its `AccountId`, routes call actions to that account's
-  backend, and declines another account's offer while one is up. Call
+  backend, and declines another account's offer while one is up. Group
+  calls: an offer carrying a roster (`IncomingCall::group`) or a `group-jid`
+  rings under its group (a call among several people with no group, under its
+  creator's chat), named by `chat_title_of` with the member who rang, and is
+  answered through the same `voip().accept`, which joins the shared relay and
+  epoch key; the library mixes everyone's audio into the one speaker stream.
+  `calls::GroupRoster` keeps the newest roster snapshot by transaction
+  (`CallAction::GroupUpdate` while ringing, `CallEvent::GroupUpdated` once up),
+  and one member's `<reject>` never ends the call. The worker files roster ids
+  under canonical chat ids and drops our own entry (`canonical_call`), and the
+  call's entry goes in the group under the member who rang. The library
+  reports no per-person speaking level or mute, so the tiles show neither.
+  Group video frames name their sender (`VideoFrame::sender`):
+  `decode_remote` keeps a decoder per sender (`MAX_REMOTE_STREAMS`, the oldest
+  let go), converts at tile size, and `VideoTick::RemoteFrom` reaches the
+  window as `Event::CallVideo { from }` under the member's chat id;
+  `Participant::video` follows their first frame, their own video state and
+  the roster. We have a tile of our own in the grid (`App::call_self`): our
+  camera, else our photo, with a muted sign when we are muted, and
+  `request_peer_keyframe` does nothing in a group call. A call link
+  (`safety::call_link`, `/voice/`, `/audio/` or `/video/`) clicked in a message
+  is joined with `voip().call_link(token, ..)` on a task of its own, since the
+  waiting room may hold it indefinitely; its answer returns as
+  `CallRuntimeEvent::LinkJoined`, and hanging up aborts it. Such a call has an
+  empty chat and `GroupCall::link`, and its local entry is filed under
+  `model::CALL_LINK_CHAT`, an id no chat has: it reaches the Calls page
+  (`Event::CallLog`) and nothing else, and its row there opens nothing. The library has no
+  way to join a group's ongoing call uninvited, so there is no Join banner.
+  Linked devices cannot start group calls (the server answers 427), so a group
+  has no call button, and a group's voice call cannot gain video. Call
   updates are withheld during privacy recovery like other private content,
   and a locked chat's call shows only "Locked chat" until its folder opens.
   Calls open the system default devices; the call screen's pickers apply to
@@ -398,6 +428,11 @@ protocol. These notes are for coding agents and new contributors.
   fastframe-tray (ksni on Linux, tray-icon on Windows and macOS; on macOS
   made with the first window and pumped by `fastframe_tray::idle` while none
   exists), and `src/macos.rs` hands its menu events to `fastframe_tray::claim_menu_event` first.
+  The process Dock icon and unread badge use fastframe-dock; a Cargo run
+  gets the embedded icon, while a packaged app keeps its bundle icon. The
+  unread-chat count stays in ZapFast and survives window replacement.
+  Clicking the macOS menu-bar icon opens its menu; **Show or hide ZapFast**
+  toggles the window, and clicking the Dock icon shows it.
   Closing keeps ZapFast running only while `Tray::is_shown`: on Linux the
   item exists before a panel shows it (a start at login beats the panel, and
   GNOME's tray watcher) and registers once one appears. A hidden start with

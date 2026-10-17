@@ -449,6 +449,14 @@ pub enum Command {
         generation: u64,
         cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
     },
+    /// Joins a call link by its token, with video for a video call's link. `generation` and
+    /// `cancel` are what [`Command::StartCall`] carries.
+    JoinCallLink {
+        token: String,
+        video: bool,
+        generation: u64,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    },
     /// Answers the ringing incoming call with the real `<accept>`.
     AnswerCall,
     /// Declines the ringing incoming call with the real `<reject>`.
@@ -1246,6 +1254,9 @@ pub enum Event {
     CallVideo {
         local: Option<Arc<egui::ColorImage>>,
         remote: Option<Arc<egui::ColorImage>>,
+        /// Whose picture `remote` is on a group call, by chat id; `None` for the peer of a
+        /// one-to-one call.
+        from: Option<String>,
     },
     /// Informational toast message.
     Info(String),

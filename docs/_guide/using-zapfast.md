@@ -474,6 +474,30 @@ Calls use your platform's own audio (PipeWire or ALSA on Linux, Core Audio on
 macOS, WASAPI on Windows), with no echo cancellation of their own: use
 headphones, or your system's echo cancellation, when the speaker is loud.
 
+### Group calls
+
+A group call rings under the group's name and picture and says who is calling
+("Group voice call from Jonas"), with the faces of those already on it. Once
+you answer, everyone on the call has a tile with their picture and name, and
+so do you, as **You** (with a red microphone while you are muted); someone who
+was asked but has not joined yet reads **Invited**, and the tiles follow people
+as they join and leave. Mute, the device pickers and hang up work as in
+any call, and hanging up leaves the call to the others. In a group's video
+call each member's camera fills their tile, and yours fills your own tile;
+someone whose camera is off keeps their photo. The camera
+button turns yours off and on. A group's voice call stays a voice call. ZapFast does not start group calls: WhatsApp refuses them
+from linked devices, so a group's header has no call button, and a group call is
+started on the phone.
+
+A call link in a message (`call.whatsapp.com/voice/…` or `/video/…`) joins
+that call here rather than opening the browser. The call screen says
+**Connecting…** until the call lets you in, which can take a while when its
+creator admits people one by one, then shows everyone on it as in a group call.
+Hanging up while you wait stops the join. A call joined through a link belongs
+to no chat: it is not filed in one, and shows on the Calls page as **Call
+link** with a link sign for a picture. That row only records the call; there
+is no chat to open from it and no one to call back.
+
 One call at a time: a call to another of your numbers while one is up is
 declined there. With several numbers linked, a call to a number that is not on
 screen still rings, under that number's own names.
@@ -503,8 +527,8 @@ number, each with a voice and a video button. Click **Chats** in the rail,
 press `Ctrl+Shift+1`, or press Escape to go back to the chats. Switching
 numbers keeps the Calls tab open on the other number's calls. In a narrow
 window the list takes the whole window beside the rail, and a picked call's
-chat opens over both, with a Back button. Group calls show up in the history,
-but are placed and answered on the phone.
+chat opens over both, with a Back button. Group calls show up in the history
+under their group, named by who called; they are started on the phone.
 
 ## Copying
 
@@ -706,12 +730,16 @@ chat**, and the button beside it (`Ctrl+B`), which hides the list: the chats'
 avatars then fill the rail between its top and bottom buttons. Unread chats
 show their badge, hovering names a chat, clicking opens it, and `Ctrl+B` or
 the button under **Starred** brings the full list back.
+In a short window, scroll the rail to reach its lower buttons. Tab and
+Shift+Tab bring the focused button into view, too.
 
 ## Notifications and the tray
 
-Closing the window keeps ZapFast linked in the tray. Click the tray icon or
-launch the app again to reopen it. To quit, use **Quit** in the tray menu, or
-**Quit** in the Dock icon's menu on macOS, or on Linux **Quit ZapFast** in the
+Closing the window keeps ZapFast linked in the tray. On macOS, click the menu
+bar icon to open its menu, then choose **Show or hide ZapFast** to reopen the
+window. On Linux and Windows, click the tray icon to reopen it. Launching the
+app again reopens the window on every platform. To quit, use **Quit** in the
+tray menu, or **Quit** in the Dock icon's menu on macOS, or on Linux **Quit ZapFast** in the
 launcher's right-click menu (KDE Plasma's task manager and application menu,
 GNOME's Dash). On every platform, `zapfast quit` in a terminal or a script quits
 the running copy the same way, and does nothing when none runs. A copy from
@@ -723,11 +751,15 @@ or Dash to Panel. Windows overlays a compact unread-message count on ZapFast's
 taskbar button while the window is open, using `99+` above 99. Windows must use
 its regular taskbar icon size for overlays to appear. The count
 does not count toasts remaining in Windows notification history. On macOS, the
-Dock icon shows the number of unread chats in a red badge. On Linux and
+Dock icon shows the number of unread chats in a red badge. The icon and
+badge stay with the app when its window is closed and reopened. A macOS
+source build run through Cargo uses ZapFast's icon too. Starting hidden
+lets you open the first window from the menu-bar menu. On Linux and
 Windows, notifications show the chat picture. On Linux, Windows, and macOS, a
-click on a notification opens the chat at the message it announced. On Linux
-and macOS this holds for the 32 most recent notifications (older ones only
-bring ZapFast forward), and reading a chat removes its notifications. macOS
+click on a notification opens the chat at the message it announced. This holds for the 32 most recent tracked notifications on all three platforms;
+older notifications remain in system history without a message click listener.
+Reading a chat removes its tracked notifications, including Windows toasts.
+Fastframe provides the same delivery and cancellation interface on each platform. macOS
 asks once for permission to show notifications. On Linux, a notification that arrives while the
 window is open behind others also highlights ZapFast in the taskbar until you
 switch to it. Muted chats do not send notifications, and

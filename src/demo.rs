@@ -2499,6 +2499,33 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
                     call.outcome = Some(crate::calls::CallOutcome::Answered);
                 }
             }
+            // A group's call: ringing with who started it and who is on it, and
+            // up with a tile for each member, one of them only asked to it.
+            "call-group" => group_call_sample(app, true, false),
+            "call-group-active" => group_call_sample(app, false, false),
+            // A group's video call: three members' cameras on, Tom's off, and
+            // ours in the corner.
+            "call-group-video" => group_call_sample(app, false, true),
+            // The same call with our microphone muted: our own tile says so.
+            "call-group-muted" => {
+                group_call_sample(app, false, false);
+                if let Some(call) = app.call.as_mut() {
+                    call.muted = true;
+                }
+            }
+            // A call link from a message, while the call service lets us in.
+            "call-link" => {
+                call_sample(app, false, false);
+                if let Some(call) = app.call.as_mut() {
+                    call.chat = String::new();
+                    call.phase = CallPhase::Connecting;
+                    call.started = None;
+                    call.group = Some(crate::calls::GroupCall {
+                        link: true,
+                        ..crate::calls::GroupCall::default()
+                    });
+                }
+            }
             "call-strip" => {
                 call_sample(app, false, false);
                 app.call_surface_hidden = true;
@@ -2523,12 +2550,28 @@ pub fn apply_flags(app: &mut App, page: Option<&str>) {
             // picked, that row's chat at the call.
             // The Missed chip picked, and with no missed call to show.
             "calls" | "calls-chat" | "calls-info" | "new-call" | "calls-missed"
-            | "calls-missed-none" => {
+            | "calls-missed-none" | "calls-link" => {
                 app.page = Page::Calls;
                 if part != "calls-chat" {
                     app.open_chat = None;
                 }
                 let mut log = call_entries(crate::util::now());
+                if part == "calls-link" {
+                    // A video call joined through a link half an hour ago,
+                    // which no chat holds.
+                    log.push(message(
+                        crate::model::CALL_LINK_CHAT,
+                        &format!("{}link-1", crate::model::CALL_ENTRY_PREFIX),
+                        true,
+                        crate::util::now() - 30,
+                        Content::Call {
+                            video: true,
+                            status: crate::model::CallStatus::Answered,
+                            duration: 1_260,
+                            group: true,
+                        },
+                    ));
+                }
                 if part.starts_with("calls-missed") {
                     app.call_filter = crate::model::CallFilter::Missed;
                 }
@@ -3846,11 +3889,55 @@ pub fn call_sample(app: &mut App, incoming: bool, video: bool) {
         microphone: None,
         speaker: None,
         camera: None,
+        group: None,
     });
     app.call_account = Some(app.account().id.clone());
     if video && !incoming {
         app.call_remote_frame = Some(std::sync::Arc::new(stock_frame(stock::SPACEWALK, 720)));
         app.call_local_frame = Some(std::sync::Arc::new(stock_frame(stock::DUSK, 320)));
+    }
+}
+
+/// A call in the Rust Berlin group, started by Jonas: Mira, Tom and Ada are
+/// on it, and Grace was asked and has not joined.
+pub fn group_call_sample(app: &mut App, incoming: bool, video: bool) {
+    call_sample(app, incoming, video);
+    let roster = [
+        ("491701111111@s.whatsapp.net", true),
+        ("491702222222@s.whatsapp.net", true),
+        ("491703333333@s.whatsapp.net", true),
+        (SAMPLES[0].id, true),
+        (SAMPLES[2].id, false),
+    ];
+    // Who sends a picture on a video call, and which stand-in it is.
+    let cameras = [
+        (roster[0].0, stock::VENUE),
+        (roster[1].0, stock::SPACEWALK),
+        (roster[3].0, stock::LAUNCH),
+    ];
+    let sending = |id: &str| video && cameras.iter().any(|(camera, _)| *camera == id);
+    if let Some(call) = app.call.as_mut() {
+        call.chat = SAMPLES[1].id.to_owned();
+        call.remote_video = false;
+        call.group = Some(crate::calls::GroupCall {
+            link: false,
+            caller: Some(roster[0].0.to_owned()),
+            participants: roster
+                .iter()
+                .map(|(id, joined)| crate::calls::Participant {
+                    id: (*id).to_owned(),
+                    joined: *joined,
+                    video: sending(id),
+                })
+                .collect(),
+        });
+    }
+    app.call_remote_frame = None;
+    if video && !incoming {
+        for (id, photo) in cameras {
+            app.call_member_frames
+                .insert(id.to_owned(), std::sync::Arc::new(stock_frame(photo, 360)));
+        }
     }
 }
 
@@ -5975,6 +6062,12 @@ mod tests {
             "call-devices",
             "call-ended",
             "call-strip",
+            "call-group",
+            "call-group-active",
+            "call-group-video",
+            "call-group-muted",
+            "call-link",
+            "calls-link",
             "call-video",
             "call-video,light",
             "call-video-incoming",
@@ -6069,7 +6162,16 @@ mod tests {
     /// and in each layout: GNOME's buttons at the right or the left, and
     /// Windows' taller row. Headers that reach a corner leave the buttons
     /// room beside their own controls, or move them down when narrow.
+    ///
+    /// Not on macOS, which never draws them: its headers keep the traffic
+    /// lights' layout under any preview, and drag the window from their top
+    /// (fastframe-titlebar's drag area, which senses clicks) wherever the
+    /// caption buttons would stand.
     #[test]
+    #[cfg_attr(
+        target_os = "macos",
+        ignore = "macOS has the traffic lights, never the drawn caption buttons"
+    )]
     fn header_controls_keep_clear_of_the_drawn_caption_buttons() {
         use fastframe_titlebar::Footprint;
         let footprints = [
@@ -6106,6 +6208,13 @@ mod tests {
             ("call-active", wide),
             ("call", wide),
             ("call-active", narrow),
+            ("call-group", wide),
+            ("call-group-active", wide),
+            ("call-group-active", narrow),
+            ("call-group-video", wide),
+            ("call-group-video", narrow),
+            ("call-group-muted", wide),
+            ("calls-link", wide),
             ("settings", wide),
             ("settings", narrow),
             ("calls", wide),
@@ -15974,56 +16083,73 @@ mod tests {
         assert!(reached_hidden, "Tab reached chats that were out of view");
     }
 
+    /// The same with the list hidden, at the window's least height: the
+    /// chats' avatars scroll between the rail's groups, and the macOS layout,
+    /// which starts the rail under the traffic lights, leaves them least.
     #[test]
     fn tab_scrolls_a_focused_collapsed_avatar_into_view() {
-        let mut app = app();
-        apply_flags(&mut app, Some("settings,rail"));
-        let ctx = egui::Context::default();
-        app.attach(&ctx);
-        let height = 300.0;
-        for _ in 0..3 {
-            frame_sized(&mut app, &ctx, height, Vec::new());
-        }
-        let avatar = |ctx: &egui::Context, id: &str| {
-            ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::compact_chat_id(id)))
-        };
-        let ids: Vec<String> = app.chats.iter().map(|chat| chat.id.clone()).collect();
-        let hidden: Vec<&String> = ids
-            .iter()
-            .filter(|id| avatar(&ctx, id).is_none_or(|rect| rect.top() >= height))
-            .collect();
-        assert!(
-            !hidden.is_empty(),
-            "the window is short enough to hide avatars"
-        );
-        let mut reached_hidden = false;
-        for _ in 0..40 {
-            frame_sized(&mut app, &ctx, height, tab());
+        for macos in [false, true] {
+            let mut app = app();
+            apply_flags(&mut app, Some("settings,rail"));
+            let ctx = egui::Context::default();
+            app.attach(&ctx);
+            if macos {
+                crate::theme::preview_macos(&ctx);
+            }
+            // `main`'s least window height.
+            let height = 300.0;
             for _ in 0..3 {
                 frame_sized(&mut app, &ctx, height, Vec::new());
             }
-            let Some(focused) = ctx
-                .memory(|memory| memory.focused())
-                .and_then(|id| ctx.read_response(id))
-            else {
-                continue;
+            let avatar = |ctx: &egui::Context, id: &str| {
+                ctx.data(|data| data.get_temp::<egui::Rect>(crate::ui::chats::compact_chat_id(id)))
             };
-            // Settings has its own scrolling; only the rail is under test.
-            if !ids
+            let ids: Vec<String> = app.chats.iter().map(|chat| chat.id.clone()).collect();
+            let hidden: Vec<&String> = ids
                 .iter()
-                .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect))
-            {
-                continue;
-            }
-            assert_eq!(
-                focused.interact_rect, focused.rect,
-                "the focused avatar is fully visible"
+                .filter(|id| avatar(&ctx, id).is_none_or(|rect| rect.top() >= height))
+                .collect();
+            assert!(
+                !hidden.is_empty(),
+                "{macos}: the window is short enough to hide avatars"
             );
-            reached_hidden |= hidden
-                .iter()
-                .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect));
+            let mut reached_hidden = false;
+            for _ in 0..40 {
+                frame_sized(&mut app, &ctx, height, tab());
+                for _ in 0..3 {
+                    frame_sized(&mut app, &ctx, height, Vec::new());
+                }
+                let Some(focused) = ctx
+                    .memory(|memory| memory.focused())
+                    .and_then(|id| ctx.read_response(id))
+                else {
+                    continue;
+                };
+                // Settings has its own scrolling; only the rail is under test.
+                if !ids
+                    .iter()
+                    .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect))
+                {
+                    continue;
+                }
+                assert_eq!(
+                    focused.interact_rect, focused.rect,
+                    "{macos}: the focused avatar is fully visible"
+                );
+                assert!(
+                    focused.rect.bottom() <= height,
+                    "{macos}: inside the window: {:?}",
+                    focused.rect
+                );
+                reached_hidden |= hidden
+                    .iter()
+                    .any(|id| avatar(&ctx, id).is_some_and(|rect| rect == focused.rect));
+            }
+            assert!(
+                reached_hidden,
+                "{macos}: Tab reached avatars that were out of view"
+            );
         }
-        assert!(reached_hidden, "Tab reached avatars that were out of view");
     }
 
     /// Records the images the UI asks for, answering at once so a frame can be
@@ -16913,6 +17039,14 @@ mod bubble_detail_tests {
     /// by 800 window.
     #[test]
     fn messages_balloons_tail_only_the_last_of_each_run() {
+        // These runs belong to one day. Near midnight a real clock puts a
+        // day boundary between them, correctly giving another bubble a tail.
+        let _clock = crate::util::fixed_clock::set(crate::util::fixed_clock::Clock {
+            // 14:00 UTC on Wednesday 11 March 2026.
+            now: 1_773_237_600,
+            zone: jiff::tz::TimeZone::UTC,
+            twelve_hour: false,
+        });
         const SIZE: egui::Vec2 = egui::vec2(1280.0, 800.0);
         let reach = crate::ui::widgets::balloon::TIP[0] * crate::ui::widgets::MESSAGES_SCALE;
         for page in ["bubbles,messages", "bubbles,messages-light"] {
@@ -17572,6 +17706,69 @@ mod call_surface_tests {
         }
     }
 
+    /// A group's call rings under the group's name and says who started it, and once up it has a
+    /// tile for everyone on its roster, saying who has not joined. A voice call in a group offers
+    /// no camera: WhatsApp takes video only in a group call that began as one.
+    #[test]
+    fn a_group_call_names_its_group_who_rang_and_who_is_on_it() {
+        let mut ringing = app();
+        apply_flags(&mut ringing, Some("call-group"));
+        assert_eq!(ringing.call_name(), "Rust Berlin", "named by its group");
+        let caller = ringing.call_caller_name();
+        assert_eq!(caller.as_deref(), Some("Jonas"));
+        let call = ringing.call.clone().unwrap();
+        assert_eq!(
+            crate::ui::call::incoming_text(ringing.locale, &call, caller.as_deref()),
+            "Group voice call from Jonas"
+        );
+
+        let mut running = app();
+        apply_flags(&mut running, Some("call-group-active"));
+        let people: Vec<(String, bool)> = running
+            .call_people()
+            .into_iter()
+            .map(|person| (person.name, person.joined))
+            .collect();
+        assert_eq!(
+            people,
+            [
+                ("Jonas".to_owned(), true),
+                ("Mira".to_owned(), true),
+                ("Tom".to_owned(), true),
+                ("Ada Lovelace".to_owned(), true),
+                ("Grace Hopper".to_owned(), false),
+            ]
+        );
+        let ctx = egui::Context::default();
+        running.attach(&ctx);
+        ctx.enable_accesskit();
+        let shown = labels(&mut running, &ctx);
+        for expected in ["Mute", "Devices", "Hang up"] {
+            assert!(
+                shown.contains(&expected.to_owned()),
+                "{expected} is on the call screen: {shown:?}"
+            );
+        }
+        assert!(
+            !shown.contains(&"Start video".to_owned()),
+            "a group voice call offers no camera: {shown:?}"
+        );
+
+        // A locked group's call names nobody on it.
+        let group = running.call.as_ref().unwrap().chat.clone();
+        for chat in running.chats.iter_mut().filter(|chat| chat.id == group) {
+            chat.locked = true;
+        }
+        running.settings.set_chat_lock_code(Some("test-code"));
+        assert!(running.call_people().is_empty());
+        assert_eq!(
+            running.call_self().map(|me| me.name).as_deref(),
+            Some("You"),
+            "our own tile is ours to name"
+        );
+        assert_eq!(running.call_caller_name(), None);
+    }
+
     #[test]
     fn the_call_screen_labels_every_control_it_offers() {
         let (mut running, ctx) = on_a_call();
@@ -17833,7 +18030,8 @@ mod rail_tests {
             );
             assert_eq!(settings.size(), egui::vec2(36.0, 36.0));
             assert_eq!(me.size(), egui::vec2(32.0, 32.0));
-            if macos {
+            // A Mac lays out its own way whichever the preview says.
+            if crate::theme::macos_chrome(&ctx) {
                 assert!(
                     top[0].top() >= 36.0 && top[0].top() < 60.0,
                     "just below the traffic lights: {:?}",
@@ -17879,6 +18077,133 @@ mod rail_tests {
             );
             // Under Show the chat list, which takes a cell of its own.
             assert!(avatar.top() >= show.bottom());
+        }
+    }
+
+    /// At the minimum window height, Tab and Shift+Tab reveal every rail
+    /// control, including the bottom group, without crossing the title bar.
+    #[test]
+    fn tab_reveals_every_rail_control_in_a_short_window() {
+        for macos in [false, true] {
+            for page in ["chat", "rail"] {
+                for reverse in [false, true] {
+                    let (mut app, ctx) = open(page, macos);
+                    let size = egui::vec2(1180.0, 300.0);
+                    for _ in 0..3 {
+                        frame_at(&mut app, &ctx, size, Vec::new());
+                    }
+                    let mut expected = vec![
+                        Stop::Chats,
+                        Stop::Calls,
+                        Stop::Starred,
+                        Stop::Archived,
+                        Stop::Locked,
+                        Stop::Settings,
+                        Stop::Profile,
+                    ];
+                    if page == "rail" {
+                        expected.push(Stop::Sidebar);
+                    }
+                    for stop in &expected {
+                        assert!(stop_rect(&ctx, *stop).is_some(), "{stop:?} is offered");
+                    }
+                    ctx.memory_mut(|memory| {
+                        memory.request_focus(rail::destination_id(Destination::Chats));
+                    });
+                    let mut reached = std::collections::BTreeSet::new();
+                    for _ in 0..40 {
+                        frame_at(
+                            &mut app,
+                            &ctx,
+                            size,
+                            vec![egui::Event::Key {
+                                key: egui::Key::Tab,
+                                physical_key: None,
+                                pressed: true,
+                                repeat: false,
+                                modifiers: if reverse {
+                                    egui::Modifiers::SHIFT
+                                } else {
+                                    egui::Modifiers::NONE
+                                },
+                            }],
+                        );
+                        for _ in 0..3 {
+                            frame_at(&mut app, &ctx, size, Vec::new());
+                        }
+                        let focused = ctx.memory(|memory| memory.focused());
+                        let Some((stop, id)) = focus::stops(&ctx)
+                            .into_iter()
+                            .find(|(stop, id)| Some(*id) == focused && expected.contains(stop))
+                        else {
+                            continue;
+                        };
+                        let response = ctx.read_response(id).unwrap();
+                        let mut viewport = rail_rect(&ctx).unwrap();
+                        if crate::theme::traffic_light_inset(&ctx) > 0.0 {
+                            viewport.min.y += crate::theme::TOP_BAR_HEIGHT / 2.0 + 12.0;
+                        }
+                        assert_eq!(
+                            response.interact_rect, response.rect,
+                            "{page}, macOS={macos}, reverse={reverse}: {stop:?} is fully visible"
+                        );
+                        assert!(
+                            viewport.contains_rect(response.rect),
+                            "{stop:?} stays in the rail below the title bar"
+                        );
+                        reached.insert(stop);
+                    }
+                    assert_eq!(reached, expected.into_iter().collect());
+                }
+            }
+        }
+    }
+
+    /// Wheel scrolling reaches the account button at the minimum height;
+    /// growing the window restores the usual top and bottom positions.
+    #[test]
+    fn a_short_rail_scrolls_and_resets_when_the_window_grows() {
+        for macos in [false, true] {
+            for page in ["chat", "rail"] {
+                let (mut app, ctx) = open(page, macos);
+                let chats = destination_rect(&ctx, Destination::Chats);
+                let profile = stop_rect(&ctx, Stop::Profile).unwrap();
+                let size = egui::vec2(1180.0, 300.0);
+                for _ in 0..3 {
+                    frame_at(&mut app, &ctx, size, Vec::new());
+                }
+                assert!(stop_rect(&ctx, Stop::Profile).unwrap().bottom() > size.y);
+                let pointer = destination_rect(&ctx, Destination::Calls).center();
+                frame_at(
+                    &mut app,
+                    &ctx,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(pointer),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -600.0),
+                            modifiers: egui::Modifiers::NONE,
+                            phase: egui::TouchPhase::Move,
+                        },
+                    ],
+                );
+                for _ in 0..30 {
+                    frame_at(&mut app, &ctx, size, Vec::new());
+                }
+                let id = focus::control(&ctx, Stop::Profile).unwrap();
+                let response = ctx.read_response(id).unwrap();
+                assert_eq!(
+                    response.interact_rect, response.rect,
+                    "{page}, macOS={macos}: the account button is fully visible after scrolling"
+                );
+                assert!(rail_rect(&ctx).unwrap().contains_rect(response.rect));
+                for _ in 0..3 {
+                    frame(&mut app, &ctx, 1180.0, Vec::new());
+                }
+                assert_eq!(destination_rect(&ctx, Destination::Chats), chats);
+                assert_eq!(stop_rect(&ctx, Stop::Profile), Some(profile));
+            }
         }
     }
 

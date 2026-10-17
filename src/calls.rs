@@ -24,6 +24,7 @@ use crate::model::CallDirection;
 use crate::video_rate::{Cadence, Change as RateChange, FrameClock, RateControl, RateShare};
 use whatsapp_rust::prelude::{Client, Jid};
 use whatsapp_rust::types::call::{CallAction, IncomingCall};
+use whatsapp_rust::types::group_call::{GroupCallParticipant, GroupCallUpdate};
 use whatsapp_rust::voip::{
     CallEvent, CallHandle, TimedVideoFrame, VideoFrame, VideoSink, VideoSource,
 };
@@ -184,6 +185,41 @@ pub struct CallUpdate {
     pub microphone: Option<String>,
     pub speaker: Option<String>,
     pub camera: Option<String>,
+    /// Who else is on the call, for a group call; `None` for a one-to-one call.
+    pub group: Option<GroupCall>,
+}
+
+/// The people on a group call besides us, as the call's roster names them.
+///
+/// The roster is the call service's own: who it says has joined, and who it says was asked. The
+/// ids are the library's until the worker files them under the chat ids the rest of the app uses
+/// (`Worker::canonical`), and our own entry is left out there.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GroupCall {
+    /// Who rang us: the person who started the call, or who added us to one already running.
+    pub caller: Option<String>,
+    /// Everyone else on the roster, in the order the call service lists them.
+    pub participants: Vec<Participant>,
+    /// Whether we joined through a call link, which belongs to no chat.
+    pub link: bool,
+}
+
+/// One person on a group call's roster.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Participant {
+    pub id: String,
+    /// Whether the call service counts them as in the call, rather than only asked to it.
+    pub joined: bool,
+    /// Whether their camera's picture is arriving: set by their first frame, cleared when they
+    /// say their video stopped or leave the call.
+    pub video: bool,
+}
+
+impl GroupCall {
+    /// The people the call service counts as in the call.
+    pub fn joined(&self) -> impl Iterator<Item = &Participant> {
+        self.participants.iter().filter(|person| person.joined)
+    }
 }
 
 impl CallUpdate {
@@ -207,6 +243,7 @@ impl CallUpdate {
             microphone: None,
             speaker: None,
             camera: None,
+            group: None,
         }
     }
 
@@ -485,10 +522,39 @@ fn require_video(requested: bool, pipeline: bool) -> Result<()> {
 pub enum VideoTick {
     /// Our own camera, for the corner preview.
     Local(Arc<ColorImage>),
-    /// The peer's picture.
+    /// The peer's picture, on a one-to-one call.
     Remote(Arc<ColorImage>),
+    /// One member's picture on a group call, by the sender the media named, so the call screen
+    /// can put it on that member's tile.
+    RemoteFrom { sender: Jid, image: Arc<ColorImage> },
     /// The peer's picture could not be decoded: the peer is asked for a keyframe.
     Lost,
+}
+
+/// The most group members whose pictures are decoded at once. Each has a decoder of its own; a new
+/// sender past the cap takes the place of the one that began first.
+const MAX_REMOTE_STREAMS: usize = 16;
+
+/// The largest a group member's picture is converted at, either way round.
+const TILE_PICTURE: (usize, usize) = (640, 360);
+
+/// The size a group member's picture of `size` is converted at: its own, or smaller to fit
+/// [`TILE_PICTURE`] at its own shape. Never larger than it came.
+fn tile_picture(size: (usize, usize)) -> (usize, usize) {
+    let (long, short) = (size.0.max(size.1), size.0.min(size.1));
+    if long <= TILE_PICTURE.0 && short <= TILE_PICTURE.1 {
+        return size;
+    }
+    crate::camera::fit_even(size, TILE_PICTURE)
+}
+
+/// One sender's picture being decoded.
+struct RemoteStream {
+    decoder: openh264::decoder::Decoder,
+    /// Whether a keyframe has arrived, which is where a decoder can start.
+    started: bool,
+    waiting: FirstKeyframe,
+    orientation: u8,
 }
 
 /// The camera side of the call: the camera module delivers YUV 4:2:0 at a fixed size, so the
@@ -631,6 +697,12 @@ pub struct VideoPipeline {
     /// path has not changed because the camera did.
     rate: RateControl,
     rate_share: Arc<RateShare>,
+    /// What the peer's RTCP feedback has asked of our video, for the heartbeat's log line.
+    feedback: crate::video_rate::PeerFeedback,
+    /// The WhatsApp extension of the peer's latest report on our video: 24 bytes of transport
+    /// statistics after the standard report block, whose fields are not decoded yet. Logged so a
+    /// call's numbers can be set beside what we know we sent.
+    report_extension: Vec<u8>,
 }
 
 impl VideoPipeline {
@@ -647,7 +719,8 @@ impl VideoPipeline {
     fn start_blocking(
         device: Option<String>,
     ) -> Result<(Self, async_channel::Receiver<VideoTick>)> {
-        let (ticks, tick_rx) = async_channel::bounded::<VideoTick>(2);
+        // Room for a picture from each of several group members between two drains.
+        let (ticks, tick_rx) = async_channel::bounded::<VideoTick>(8);
         let (remote_tx, remote_rx) = async_channel::bounded::<VideoFrame>(8);
         decode_remote(remote_rx, ticks.clone());
         let rate_share = Arc::new(RateShare::default());
@@ -671,6 +744,8 @@ impl VideoPipeline {
                 device,
                 rate,
                 rate_share,
+                feedback: Default::default(),
+                report_extension: Vec::new(),
             },
             tick_rx,
         ))
@@ -701,6 +776,11 @@ impl VideoPipeline {
     /// The relay connection could not take all the video queued for it.
     fn on_send_drops(&mut self) -> Option<RateChange> {
         self.rate.on_send_drops(Instant::now())
+    }
+
+    /// The camera thread could not hand all its frames to the engine.
+    fn on_capture_drops(&mut self) -> Option<RateChange> {
+        self.rate.on_capture_drops(Instant::now())
     }
 
     fn source(&self) -> LocalVideoSource {
@@ -1153,7 +1233,10 @@ impl openh264::formats::YUVSource for Yuv420<'_> {
 /// Decodes the peer's access units into pictures for the UI.
 ///
 /// A decoder cannot start on a delta frame, so frames are skipped until the sink marks one as a
-/// keyframe. Runs on its own thread for the same reason the encoder does.
+/// keyframe. A group call's frames each name their sender, and each sender gets a decoder of its
+/// own (at most [`MAX_REMOTE_STREAMS`]), so every member's picture reaches its own tile; a
+/// one-to-one call's carry no sender and share one. Runs on its own thread for the same reason the
+/// encoder does.
 fn decode_remote(
     frames: async_channel::Receiver<VideoFrame>,
     ticks: async_channel::Sender<VideoTick>,
@@ -1163,55 +1246,91 @@ fn decode_remote(
         .spawn(move || {
             use openh264::formats::YUVSource as _;
 
-            let mut decoder = openh264::decoder::Decoder::new().ok();
-            let mut started = false;
-            let mut waiting = FirstKeyframe::default();
-            let mut last_orientation = 0u8;
+            let mut streams: std::collections::HashMap<Option<Jid>, RemoteStream> =
+                std::collections::HashMap::new();
+            // The order the senders began in, so the cap lets go of the oldest stream.
+            let mut order: std::collections::VecDeque<Option<Jid>> =
+                std::collections::VecDeque::new();
             while let Ok(frame) = frames.recv_blocking() {
-                if !started {
+                let key = frame.sender.as_ref().map(Jid::to_non_ad);
+                if !streams.contains_key(&key) {
+                    let Ok(decoder) = openh264::decoder::Decoder::new() else {
+                        log::error!("[CALL] remote video decoder could not start");
+                        return;
+                    };
+                    if order.len() >= MAX_REMOTE_STREAMS
+                        && let Some(oldest) = order.pop_front()
+                    {
+                        streams.remove(&oldest);
+                    }
+                    order.push_back(key.clone());
+                    streams.insert(
+                        key.clone(),
+                        RemoteStream {
+                            decoder,
+                            started: false,
+                            waiting: FirstKeyframe::default(),
+                            orientation: 0,
+                        },
+                    );
+                }
+                let Some(stream) = streams.get_mut(&key) else {
+                    continue;
+                };
+                if !stream.started {
                     if !frame.keyframe {
                         // The peer's video is flowing and none of it can be decoded: its first
                         // keyframe went missing, or went out before this side could read it. A peer
                         // sends another only when asked, so the screen would otherwise say its
-                        // camera is off for the whole call. The engine sends the request.
-                        if waiting.ask(Instant::now()) {
+                        // camera is off for the whole call. The engine sends the request (on a
+                        // one-to-one call; a group's members send keyframes on their own schedule).
+                        if stream.waiting.ask(Instant::now()) {
                             let _ = ticks.try_send(VideoTick::Lost);
                         }
                         continue;
                     }
-                    started = true;
+                    stream.started = true;
                 }
-                let Some(decoder) = decoder.as_mut() else {
-                    return;
-                };
                 // The peer's camera rotation, which the frames carry so a phone held upright arrives
                 // upright. It rides the same bits on a keyframe and on a delta frame, and a peer
                 // that turns its phone changes it mid-call, so it is read per frame rather than once.
                 let orientation = frame.orientation & 0x03;
-                if orientation != last_orientation {
-                    last_orientation = orientation;
+                if orientation != stream.orientation {
+                    stream.orientation = orientation;
                     log::info!(
                         "[CALL] remote camera orientation is {} degrees",
                         orientation as u32 * 90
                     );
                 }
                 let turns = crate::video::orientation_turns(orientation);
-                match decoder.decode(&frame.data) {
+                match stream.decoder.decode(&frame.data) {
                     Ok(Some(decoded)) => {
                         let (width, height) = decoded.dimensions();
                         if width == 0 || height == 0 {
                             continue;
                         }
-                        let image = crate::video::rgb_image(
+                        // A member's picture fills a tile of a grid, never the window, so it is
+                        // converted at a tile's size: a dozen full pictures a frame would be more
+                        // than the interface thread can upload.
+                        let out = if key.is_some() {
+                            tile_picture((width, height))
+                        } else {
+                            (width, height)
+                        };
+                        let image = Arc::new(crate::video::rgb_image(
                             decoded.y(),
                             decoded.u(),
                             decoded.v(),
                             decoded.strides(),
                             (width, height),
-                            (width, height),
+                            out,
                             turns,
-                        );
-                        let _ = ticks.try_send(VideoTick::Remote(Arc::new(image)));
+                        ));
+                        let tick = match key {
+                            Some(sender) => VideoTick::RemoteFrom { sender, image },
+                            None => VideoTick::Remote(image),
+                        };
+                        let _ = ticks.try_send(tick);
                     }
                     Ok(None) => {}
                     Err(error) => {
@@ -1239,6 +1358,7 @@ fn log_rate_change(call_id: &str, change: RateChange) {
         Reason::Loss(loss) => format!("the peer lost {:.0}% of it", loss * 100.0),
         Reason::Clean => "the peer reports a clean path".to_owned(),
         Reason::SendDrops => "video was dropped before it was sent".to_owned(),
+        Reason::CaptureDrops => "camera frames backed up before the engine".to_owned(),
         Reason::Estimate(bitrate) => format!("the peer can take {} kbps", bitrate / 1000),
     };
     let level = if change.from.tier != change.to.tier || change.reason != Reason::Clean {
@@ -1346,6 +1466,165 @@ pub struct Call {
     /// When the call was placed or began to ring, Unix seconds: the time its
     /// entry in the chat carries.
     began: i64,
+    /// The roster of a group call; `None` for a one-to-one call.
+    group: Option<GroupRoster>,
+    /// The task joining a call link, until it has joined: hanging up stops it.
+    join_task: Option<tokio::task::AbortHandle>,
+}
+
+/// What a group call's own signaling says about who is on it.
+///
+/// Kept in the library's terms (its JIDs and its participant records) and translated for the window
+/// in [`Call::update`]; the worker then files each id under the app's own chat ids.
+#[derive(Clone, Debug, Default)]
+struct GroupRoster {
+    /// Who rang us: the offer's sender, or the member who added us to a running call.
+    caller: Option<Jid>,
+    /// The transaction of the newest snapshot applied. A snapshot is the whole roster, and the call
+    /// service numbers them, so one that arrives late never replaces a newer one.
+    transaction: Option<u32>,
+    participants: Vec<GroupCallParticipant>,
+    /// The members whose pictures are arriving, by their roster JID.
+    video: Vec<Jid>,
+    /// Whether we joined through a call link.
+    link: bool,
+}
+
+impl GroupRoster {
+    /// The roster an offer rang with: `None` unless the offer is a group call's.
+    ///
+    /// A group offer names its group (`group-jid`), carries the call's roster, or both; a call
+    /// among several people with no group behind it carries the roster alone.
+    fn of_offer(incoming: &IncomingCall) -> Option<Self> {
+        let named = matches!(
+            &incoming.action,
+            CallAction::Offer {
+                group_jid: Some(_),
+                ..
+            }
+        );
+        if incoming.group.is_none() && !named {
+            return None;
+        }
+        let mut roster = Self {
+            caller: Some(offer_caller(incoming)),
+            ..Self::default()
+        };
+        if let Some(update) = incoming.group.as_deref() {
+            roster.apply(update);
+        }
+        Some(roster)
+    }
+
+    /// Takes a newer snapshot of the roster; an older one is ignored. Returns whether it changed.
+    fn apply(&mut self, update: &GroupCallUpdate) -> bool {
+        if self
+            .transaction
+            .is_some_and(|applied| update.transaction_id < applied)
+        {
+            return false;
+        }
+        self.transaction = Some(update.transaction_id);
+        if self.participants == update.participants {
+            return false;
+        }
+        self.participants = update.participants.clone();
+        // A member who left sends no picture; one who comes back says so with a new first frame.
+        let participants = &self.participants;
+        self.video.retain(|jid| {
+            participants
+                .iter()
+                .any(|person| &person.jid.to_non_ad() == jid && person.is_connected())
+        });
+        true
+    }
+
+    /// The roster entry a media sender or a signaling source belongs to: the same user, whatever
+    /// the device, by privacy id or by phone number.
+    fn member(&self, sender: &Jid) -> Option<&GroupCallParticipant> {
+        let same = |jid: &Jid| jid.user == sender.user && jid.server == sender.server;
+        self.participants
+            .iter()
+            .find(|person| same(&person.jid) || person.pn.as_ref().is_some_and(same))
+    }
+
+    /// Notes a picture from `sender`: the id its tile is drawn under, and whether it is the first
+    /// since their video began. `None` for a sender the roster does not name, who has no tile.
+    fn picture_from(&mut self, sender: &Jid) -> Option<(String, bool)> {
+        let person = self.member(sender)?;
+        let (jid, id) = (person.jid.to_non_ad(), participant_id(person));
+        let first = !self.video.contains(&jid);
+        if first {
+            self.video.push(jid);
+        }
+        Some((id, first))
+    }
+
+    /// Notes that `source` stopped sending video. Returns whether that changed anything.
+    fn video_stopped(&mut self, source: &Jid) -> bool {
+        let Some(jid) = self.member(source).map(|person| person.jid.to_non_ad()) else {
+            return false;
+        };
+        let before = self.video.len();
+        self.video.retain(|known| known != &jid);
+        self.video.len() != before
+    }
+
+    fn view(&self) -> GroupCall {
+        GroupCall {
+            link: self.link,
+            caller: self.caller.as_ref().map(Jid::to_non_ad_string),
+            participants: self
+                .participants
+                .iter()
+                .map(|person| Participant {
+                    id: participant_id(person),
+                    joined: person.is_connected(),
+                    video: self.video.contains(&person.jid.to_non_ad()),
+                })
+                .collect(),
+        }
+    }
+}
+
+/// The id a roster entry is drawn under: the phone number when the roster carries it, so the
+/// person is named the way their chat is; otherwise their privacy id.
+fn participant_id(person: &GroupCallParticipant) -> String {
+    person.pn.as_ref().unwrap_or(&person.jid).to_non_ad_string()
+}
+
+/// Who rang us with `incoming`: the member named on the call wrapper when the call service sent it
+/// (an invitation into a call already running), else the device that sent the offer, else the call's
+/// creator.
+fn offer_caller(incoming: &IncomingCall) -> Jid {
+    let from_service = matches!(incoming.from.server, whatsapp_rust::prelude::Server::Call);
+    let caller = if from_service {
+        incoming.participant.as_ref()
+    } else {
+        Some(&incoming.from)
+    };
+    caller
+        .unwrap_or_else(|| incoming.action.call_creator())
+        .to_non_ad()
+}
+
+/// The group an offer belongs to, when it names one.
+pub fn offer_group(incoming: &IncomingCall) -> Option<Jid> {
+    match &incoming.action {
+        CallAction::Offer {
+            group_jid: Some(group),
+            ..
+        } => Some(group.clone()),
+        _ => incoming
+            .group
+            .as_deref()
+            .and_then(|update| update.group_jid.clone()),
+    }
+}
+
+/// Whether an offer is a group call's, which rings under its group rather than its sender.
+pub fn offer_is_group(incoming: &IncomingCall) -> bool {
+    GroupRoster::of_offer(incoming).is_some()
 }
 
 impl Call {
@@ -1446,6 +1725,8 @@ impl Call {
                 speaker_device: speaker,
                 camera,
                 lost_devices: Vec::new(),
+                group: None,
+                join_task: None,
             },
             frames,
         ))
@@ -1455,7 +1736,12 @@ impl Call {
     /// and answering opens the system's default devices unless others are picked meanwhile.
     pub fn ringing(chat: String, incoming: Box<IncomingCall>, video: bool) -> Self {
         let call_id = incoming.action.call_id().to_owned();
-        log::info!("[CALL] incoming offer call_id={call_id} video={video}");
+        let group = GroupRoster::of_offer(&incoming);
+        log::info!(
+            "[CALL] incoming offer call_id={call_id} video={video} group={} participants={}",
+            group.is_some(),
+            group.as_ref().map_or(0, |roster| roster.participants.len())
+        );
         Self {
             generation: next_generation(),
             call_id,
@@ -1480,6 +1766,129 @@ impl Call {
             camera_wanted: false,
             peer_video_request: None,
             began: crate::util::now(),
+            group,
+            join_task: None,
+        }
+    }
+
+    /// Joins a call link: opens the devices as placing a call does, then hands the join to a task
+    /// of its own, since the call service may keep us in its waiting room for as long as it likes
+    /// and the worker must not wait with it. The task's answer arrives on `done`, and
+    /// [`Call::link_joined`] applies it. Until then the call reads as connecting.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn join_link(
+        client: &Arc<Client>,
+        generation: u64,
+        token: String,
+        video: bool,
+        camera: Option<String>,
+        cancel: &AtomicBool,
+        done: async_channel::Sender<std::result::Result<CallHandle, String>>,
+    ) -> Result<(Self, Option<async_channel::Receiver<VideoTick>>)> {
+        if let Some(missing) = missing_audio_device_off_thread(None, None).await {
+            return Err(anyhow!("no {missing} is available; a call needs one"));
+        }
+        let mut pipe = None;
+        if video {
+            match VideoPipeline::start(camera.clone()).await {
+                Ok((pipeline, frames)) => pipe = Some((pipeline, frames)),
+                Err(error) => log::warn!("[CALL] video pipeline could not start: {error}"),
+            }
+        }
+        // A video link's call takes only a video call's media, so one with no video path cannot
+        // join it at all.
+        require_video(video, pipe.is_some())?;
+        if cancel.load(Ordering::Relaxed) {
+            return Err(Cancelled.into());
+        }
+        let (mic, mic_rx) = AudioInput::spawn(None);
+        let (output, output_tx) = AudioOutput::spawn(None);
+        let endpoints = pipe
+            .as_ref()
+            .map(|(pipeline, _)| (pipeline.source(), pipeline.sink()));
+        let client = Arc::clone(client);
+        let task = tokio::spawn(async move {
+            let media = if video {
+                whatsapp_rust::types::group_call::CallLinkMedia::Video
+            } else {
+                whatsapp_rust::types::group_call::CallLinkMedia::Audio
+            };
+            let voip = client.voip();
+            let builder = voip.call_link(&token, media).audio(mic_rx, output_tx);
+            let joined = match endpoints {
+                Some((source, sink)) => builder.video(source, sink).start().await,
+                None => builder.start().await,
+            };
+            let _ = done.send(joined.map_err(|error| error.to_string())).await;
+        });
+        log::info!("[CALL] joining a call link video={video}");
+        let (video_pipe, frames) = match pipe {
+            Some((pipeline, frames)) => (Some(pipeline), Some(frames)),
+            None => (None, None),
+        };
+        Ok((
+            Self {
+                generation,
+                call_id: String::new(),
+                chat: String::new(),
+                direction: CallDirection::Outgoing,
+                video: video_pipe.is_some(),
+                phase: CallPhase::Connecting,
+                started: None,
+                outcome: None,
+                peer_audio: None,
+                incoming: None,
+                handle: None,
+                media_ready: false,
+                mic: Some(mic),
+                speaker: Some(output),
+                camera_wanted: video_pipe
+                    .as_ref()
+                    .is_some_and(VideoPipeline::camera_running),
+                peer_video_request: None,
+                began: crate::util::now(),
+                video_pipe,
+                remote_video: false,
+                microphone: None,
+                speaker_device: None,
+                camera,
+                lost_devices: Vec::new(),
+                group: Some(GroupRoster {
+                    link: true,
+                    ..GroupRoster::default()
+                }),
+                join_task: Some(task.abort_handle()),
+            },
+            frames,
+        ))
+    }
+
+    /// Applies the answer of a call link's join: the call is in and its media coming up, or it
+    /// could not get in.
+    pub fn link_joined(
+        &mut self,
+        joined: std::result::Result<CallHandle, String>,
+    ) -> Option<CallUpdate> {
+        self.join_task = None;
+        if !self.phase.is_live() {
+            return None;
+        }
+        match joined {
+            Ok(handle) => {
+                self.call_id = handle.call_id().to_owned();
+                // The roster the call service admitted us with, until its next update.
+                if let Some(state) = handle.group_state()
+                    && let Some(update) = state.snapshot()
+                    && let Some(roster) = self.group.as_mut()
+                {
+                    roster.apply(update);
+                }
+                self.handle = Some(Arc::new(handle));
+                log::info!("[CALL] joined a call link call_id={}", self.call_id);
+                self.phase = CallPhase::Accepted;
+                self.became_active().or_else(|| Some(self.update()))
+            }
+            Err(error) => self.fail(format!("the call link could not be joined: {error}")),
         }
     }
 
@@ -1511,6 +1920,8 @@ impl Call {
             camera_wanted: false,
             peer_video_request: None,
             began: crate::util::now(),
+            group: None,
+            join_task: None,
         }
     }
 
@@ -1559,7 +1970,14 @@ impl Call {
             microphone: self.microphone.clone(),
             speaker: self.speaker_device.clone(),
             camera: self.camera.clone(),
+            group: self.group.as_ref().map(GroupRoster::view),
         }
+    }
+
+    /// Whether this is a group call: one rung with a group's roster, which more than one other
+    /// person can join.
+    pub fn is_group(&self) -> bool {
+        self.group.is_some()
     }
 
     /// When the call was placed or began to ring, Unix seconds.
@@ -1825,6 +2243,11 @@ impl Call {
 
     /// Releases every local resource. Safe to call twice.
     pub fn cleanup(&mut self) {
+        if let Some(task) = self.join_task.take() {
+            // A call link still being joined is let go: the library's own guard ends what it
+            // had begun with the call service.
+            task.abort();
+        }
         if let Some(mut pipe) = self.video_pipe.take() {
             pipe.shutdown();
         }
@@ -1854,6 +2277,23 @@ impl Call {
                 self.phase
             );
             return None;
+        }
+        if let Some(roster) = self.group.as_mut() {
+            match action {
+                // A newer roster: someone joined, left, or was asked in.
+                CallAction::GroupUpdate { update } => {
+                    return roster.apply(update).then(|| self.update());
+                }
+                // One invited member's answer speaks for that member alone; the call goes on for
+                // everyone else, and the roster says who is on it. The library leaves the call
+                // registered for the same reason.
+                CallAction::Reject { .. }
+                | CallAction::PreAccept { .. }
+                | CallAction::Accept { .. } => {
+                    return None;
+                }
+                _ => {}
+            }
         }
         match action {
             CallAction::PreAccept { .. } => {
@@ -1910,6 +2350,24 @@ impl Call {
     /// Applies one media-plane event.
     pub fn media(&mut self, event: &CallEvent) -> Option<CallUpdate> {
         match event {
+            // The committed roster of a group call: who joined, who left.
+            CallEvent::GroupUpdated(update) => {
+                let changed = self.group.as_mut()?.apply(update);
+                if changed {
+                    log::info!(
+                        "[CALL] group roster call_id={} transaction={} joined={} listed={}",
+                        self.call_id,
+                        update.transaction_id,
+                        update
+                            .participants
+                            .iter()
+                            .filter(|person| person.is_connected())
+                            .count(),
+                        update.participants.len()
+                    );
+                }
+                changed.then(|| self.update())
+            }
             CallEvent::RelayAllocated => {
                 self.media_ready = true;
                 self.became_active()
@@ -2003,10 +2461,19 @@ impl Call {
                 None
             }
             CallEvent::PeerVideoStateChanged {
+                source,
                 state,
                 upgrade_token,
                 ..
             } => {
+                if let Some(roster) = self.group.as_mut() {
+                    // One member's camera: their tile goes back to their picture when it stops.
+                    // A group's call never turns into a video call, so a request is not asked.
+                    if state.is_inactive_for_call_mode() && roster.video_stopped(source) {
+                        return Some(self.update());
+                    }
+                    return None;
+                }
                 if state.is_upgrade_request() && !self.video {
                     // The peer turned their camera on in a voice call: the screen asks, and the
                     // camera button answers. A request resolved by signaling has no token.
@@ -2034,6 +2501,17 @@ impl Call {
                 ..
             } => {
                 let pipe = self.video_pipe.as_mut()?;
+                for item in feedback {
+                    pipe.feedback.note(item.packet_type, item.fmt, &item.fci);
+                }
+                // The peer's native video report covers our video stream alone.
+                if *reports_video
+                    && !*reports_audio
+                    && let Some(block) = report_blocks.first()
+                    && !block.profile_extension.is_empty()
+                {
+                    pipe.report_extension.clone_from(&block.profile_extension);
+                }
                 let blocks: Vec<(u32, u8)> = report_blocks
                     .iter()
                     .map(|block| (block.ssrc, block.fraction_lost))
@@ -2076,7 +2554,7 @@ impl Call {
         };
         if pipe.rate_share.take_queue_drops() > 0
             && active
-            && let Some(change) = pipe.on_send_drops()
+            && let Some(change) = pipe.on_capture_drops()
         {
             log_rate_change(&self.call_id, change);
         }
@@ -2111,13 +2589,24 @@ impl Call {
         );
         if let Some(pipe) = &self.video_pipe {
             let rate = pipe.rate();
+            let feedback = pipe.feedback;
             log::info!(
-                "[CALL] video send call_id={} at={} bitrate_kbps={} picture={} max_fps={}",
+                "[CALL] video send call_id={} at={} bitrate_kbps={} picture={} max_fps={} \
+                 peer_nacked_packets={} peer_plis={} peer_firs={} peer_estimates={} \
+                 peer_estimate_kbps={} peer_report_extension={}",
                 self.call_id,
                 marker,
                 rate.bitrate / 1000,
                 rate.tier().name,
                 rate.tier().fps,
+                feedback.nacked_packets,
+                feedback.picture_loss,
+                feedback.full_intra,
+                feedback.estimates,
+                feedback
+                    .last_estimate
+                    .map_or_else(|| "none".to_owned(), |bps| (bps / 1000).to_string()),
+                crate::settings::hex(&pipe.report_extension),
             );
         }
         self.log_audio_path(marker);
@@ -2214,6 +2703,11 @@ impl Call {
             return None;
         }
         self.phase = CallPhase::Active;
+        // Frames the camera could not hand over while the peer's phone rang say nothing about the
+        // path, and the first heartbeat would otherwise read them as congestion and cut the rate.
+        if let Some(pipe) = &self.video_pipe {
+            pipe.rate_share.take_queue_drops();
+        }
         // The timer starts here, when there is really a call, never at the button press.
         self.started = Some(Instant::now());
         log::info!(
@@ -2479,6 +2973,20 @@ impl Call {
         Ok(self.update())
     }
 
+    /// Notes a group member's picture: the id of the tile it belongs on, and whether it is the
+    /// first since their video began (which the call screen is told, so the tile turns to it).
+    /// `None` on a one-to-one call, or for a sender the roster does not name.
+    pub fn group_picture(&mut self, sender: &Jid) -> Option<(String, bool)> {
+        let (id, first) = self.group.as_mut()?.picture_from(sender)?;
+        if first {
+            log::info!(
+                "[CALL] a group member's video began call_id={}",
+                self.call_id
+            );
+        }
+        Some((id, first))
+    }
+
     /// Whether the peer's picture is the one to show right now.
     ///
     /// The flag itself is private so it can only be set by a frame arriving and cleared by the
@@ -2689,6 +3197,8 @@ mod tests {
             device: None,
             rate: RateControl::new(Arc::clone(&rate_share)),
             rate_share,
+            feedback: Default::default(),
+            report_extension: Vec::new(),
         }
     }
 
@@ -2986,6 +3496,7 @@ mod tests {
             microphone: None,
             speaker: None,
             camera: None,
+            group: None,
         }
     }
 
@@ -3513,6 +4024,83 @@ mod tests {
         voice.check_video_queue();
     }
 
+    /// Frames the camera could not hand over while the phone rang are not counted against the
+    /// path at the first heartbeat of the call.
+    #[test]
+    fn drops_from_before_the_call_was_up_do_not_cut_the_rate() {
+        let mut call = dialing();
+        call.video = true;
+        call.phase = CallPhase::Accepted;
+        call.media_ready = true;
+        call.video_pipe = Some(pipeline_with_a_running_camera());
+        fn pipe(call: &Call) -> &VideoPipeline {
+            call.video_pipe.as_ref().expect("video")
+        }
+        pipe(&call).rate_share.note_queue_drop();
+        assert!(call.became_active().is_some());
+        call.check_video_queue();
+        assert_eq!(pipe(&call).rate().bitrate, crate::video_rate::START_BITRATE);
+    }
+
+    /// The peer's NACKs, keyframe requests and estimates are tallied for the heartbeat's log line,
+    /// with the extension of its latest report on our video.
+    #[test]
+    fn the_peers_feedback_on_our_video_is_tallied() {
+        use whatsapp_rust::voip_control::{MediaRtcpFeedback, MediaRtcpReportBlock};
+        let feedback = |packet_type: u8, fmt: u8, fci: &[u8]| {
+            MediaRtcpFeedback::builder()
+                .packet_type(packet_type)
+                .fmt(fmt)
+                .sender_ssrc(1)
+                .media_ssrc(9)
+                .fci(fci.to_vec())
+                .build()
+        };
+        let block = MediaRtcpReportBlock::builder()
+            .ssrc(9)
+            .fraction_lost(0)
+            .cumulative_lost(0)
+            .extended_highest_sequence(0)
+            .jitter(0)
+            .last_sender_report(0)
+            .delay_since_last_sender_report(0)
+            .profile_extension(vec![0xab; 24])
+            .build();
+        let mut call = dialing();
+        call.video = true;
+        call.video_pipe = Some(pipeline_with_a_running_camera());
+        call.media(&CallEvent::RtcpReceived {
+            packet_types: vec![201, 205, 206, 206],
+            sender_ssrc: 1,
+            referenced_ssrcs: vec![9],
+            reports_audio: false,
+            reports_video: true,
+            report_blocks: vec![block],
+            feedback: vec![
+                // One packet and the two its bitmask names.
+                feedback(205, 1, &[0, 10, 0b101, 0]),
+                feedback(206, 1, &[]),
+                feedback(
+                    206,
+                    15,
+                    &[b'R', b'E', b'M', b'B', 1, 4 << 2, 0x30, 0xD4, 0, 0, 0, 9],
+                ),
+            ],
+        });
+        let pipe = call.video_pipe.as_ref().expect("video");
+        assert_eq!(
+            pipe.feedback,
+            crate::video_rate::PeerFeedback {
+                nacked_packets: 3,
+                picture_loss: 1,
+                full_intra: 0,
+                estimates: 1,
+                last_estimate: Some(200_000),
+            }
+        );
+        assert_eq!(pipe.report_extension, vec![0xab; 24]);
+    }
+
     #[test]
     fn the_corner_preview_keeps_the_capture_shape() {
         assert_eq!(preview_size((1280, 720)), (320, 180));
@@ -3574,6 +4162,8 @@ mod tests {
             camera_wanted: false,
             peer_video_request: None,
             began: crate::util::now(),
+            group: None,
+            join_task: None,
         }
     }
 
@@ -3605,6 +4195,232 @@ mod tests {
             duration: None,
             audio_duration: None,
         }
+    }
+
+    use test_offers::{GROUP, group_offer, member, roster};
+
+    #[test]
+    fn a_group_offer_rings_with_its_caller_and_roster() {
+        let incoming = group_offer(vec![
+            member("200000000000001", true),
+            member("200000000000002", false),
+        ]);
+        assert!(offer_is_group(&incoming));
+        assert_eq!(
+            offer_group(&incoming).map(|jid| jid.to_string()),
+            Some(GROUP.to_owned())
+        );
+        let call = Call::ringing(GROUP.to_owned(), Box::new(incoming), false);
+        assert!(call.is_group());
+        let group = call.update().group.expect("a group call");
+        assert_eq!(
+            group.caller.as_deref(),
+            Some("200000000000001@lid"),
+            "the device that rang, without its device number"
+        );
+        assert_eq!(
+            group.participants,
+            vec![
+                Participant {
+                    id: "200000000000001@lid".to_owned(),
+                    joined: true,
+                    video: false,
+                },
+                Participant {
+                    id: "200000000000002@lid".to_owned(),
+                    joined: false,
+                    video: false,
+                },
+            ]
+        );
+    }
+
+    /// A member's first picture turns their tile to it; their own video state stopping, or their
+    /// leaving, turns it back, and a picture from someone the roster does not name has no tile.
+    #[test]
+    fn a_members_picture_comes_and_goes_with_their_camera() {
+        use whatsapp_rust::voip::VideoState;
+        let incoming = group_offer(vec![
+            member("200000000000001", true),
+            member("200000000000002", true),
+        ]);
+        let mut call = Call::ringing(GROUP.to_owned(), Box::new(incoming), true);
+        call.phase = CallPhase::Active;
+        let sender: Jid = "200000000000002:4@lid".parse().unwrap();
+        let sending = |call: &Call| -> Vec<bool> {
+            call.update()
+                .group
+                .unwrap()
+                .participants
+                .iter()
+                .map(|person| person.video)
+                .collect()
+        };
+
+        assert_eq!(
+            call.group_picture(&sender),
+            Some(("200000000000002@lid".to_owned(), true)),
+            "the first picture, from any of the member's devices"
+        );
+        assert_eq!(
+            call.group_picture(&sender),
+            Some(("200000000000002@lid".to_owned(), false))
+        );
+        assert_eq!(sending(&call), [false, true]);
+        assert_eq!(
+            call.group_picture(&"200000000000077@lid".parse().unwrap()),
+            None,
+            "a stranger has no tile"
+        );
+
+        let stopped = CallEvent::PeerVideoStateChanged {
+            source: sender.clone(),
+            call_creator: test_offers::CREATOR.parse().unwrap(),
+            state: VideoState::Stopped,
+            orientation: None,
+            upgrade_token: None,
+        };
+        assert!(call.media(&stopped).is_some(), "their tile goes back");
+        assert_eq!(sending(&call), [false, false]);
+        assert!(call.media(&stopped).is_none(), "only once");
+
+        call.group_picture(&sender);
+        let left = roster(2, vec![member("200000000000001", true)]);
+        call.media(&CallEvent::GroupUpdated(Box::new(left)));
+        let back = roster(
+            3,
+            vec![
+                member("200000000000001", true),
+                member("200000000000002", true),
+            ],
+        );
+        call.media(&CallEvent::GroupUpdated(Box::new(back)));
+        assert_eq!(
+            sending(&call),
+            [false, false],
+            "someone who left and came back has not sent a picture yet"
+        );
+    }
+
+    /// A call link the call service will not let us into fails as a call that never came up,
+    /// and a join that answers after a hang-up changes nothing.
+    #[test]
+    fn a_call_link_that_cannot_be_joined_says_so() {
+        let mut call = dialing();
+        call.call_id = String::new();
+        call.chat = String::new();
+        call.phase = CallPhase::Connecting;
+        call.group = Some(GroupRoster {
+            link: true,
+            ..GroupRoster::default()
+        });
+        assert!(call.update().group.is_some_and(|group| group.link));
+        let update = call
+            .link_joined(Err("call-link ended before admission".to_owned()))
+            .expect("the screen is told");
+        assert_eq!(update.phase, CallPhase::Failed);
+        assert_eq!(update.outcome, Some(CallOutcome::Failed));
+        assert!(call.link_joined(Err("again".to_owned())).is_none());
+    }
+
+    #[test]
+    fn a_one_to_one_offer_is_no_group_call() {
+        let incoming = IncomingCall::builder()
+            .from(creator())
+            .stanza_id("STANZA".to_owned())
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: CALL_ID.to_owned(),
+                call_creator: creator(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: false,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: None,
+            })
+            .build();
+        assert!(!offer_is_group(&incoming));
+        let call = Call::ringing(PEER.to_owned(), Box::new(incoming), false);
+        assert!(call.update().group.is_none());
+    }
+
+    #[test]
+    fn an_invitation_from_the_call_service_names_the_member_who_added_us() {
+        let mut incoming = group_offer(vec![member("200000000000003", true)]);
+        incoming.from = format!("{CALL_ID}@call").parse().unwrap();
+        incoming.participant = Some("200000000000003:7@lid".parse().unwrap());
+        let call = Call::ringing(GROUP.to_owned(), Box::new(incoming), false);
+        assert_eq!(
+            call.update()
+                .group
+                .and_then(|group| group.caller)
+                .as_deref(),
+            Some("200000000000003@lid")
+        );
+    }
+
+    /// Joining and leaving are new roster snapshots; a late one never undoes a newer one, and one
+    /// member saying no leaves the call to everyone else.
+    #[test]
+    fn a_group_calls_roster_follows_the_newest_snapshot() {
+        let incoming = group_offer(vec![member("200000000000001", true)]);
+        let mut call = Call::ringing(GROUP.to_owned(), Box::new(incoming), false);
+        call.phase = CallPhase::Active;
+        call.started = Some(Instant::now());
+
+        let joined = roster(
+            3,
+            vec![
+                member("200000000000001", true),
+                member("200000000000002", true),
+            ],
+        );
+        let update = call
+            .media(&CallEvent::GroupUpdated(Box::new(joined.clone())))
+            .expect("someone joined");
+        assert_eq!(update.group.unwrap().joined().count(), 2);
+        assert!(
+            call.media(&CallEvent::GroupUpdated(Box::new(joined)))
+                .is_none(),
+            "the same roster again changes nothing"
+        );
+
+        let stale = roster(2, vec![member("200000000000001", true)]);
+        assert!(
+            call.signaling(&CallAction::GroupUpdate {
+                update: Box::new(stale)
+            })
+            .is_none(),
+            "an older snapshot is not applied"
+        );
+        assert_eq!(call.update().group.unwrap().participants.len(), 2);
+
+        let left = roster(4, vec![member("200000000000002", true)]);
+        let update = call
+            .signaling(&CallAction::GroupUpdate {
+                update: Box::new(left),
+            })
+            .expect("someone left");
+        assert_eq!(update.group.unwrap().participants.len(), 1);
+
+        assert!(
+            call.signaling(&CallAction::Reject {
+                call_id: CALL_ID.to_owned(),
+                call_creator: creator(),
+                reason: None,
+            })
+            .is_none(),
+            "one member's refusal is not the end of the call"
+        );
+        assert_eq!(call.phase(), CallPhase::Active);
+
+        let ended = call
+            .signaling(&terminate(Some("group_call_ended")))
+            .expect("the call service ends it");
+        assert_eq!(ended.phase, CallPhase::Ended);
+        assert_eq!(ended.outcome, Some(CallOutcome::Answered));
     }
 
     #[test]
@@ -3903,5 +4719,62 @@ mod hardware_tests {
                 camera.label
             );
         }
+    }
+}
+
+/// Group call offers and rosters as the library hands them over, for the tests here and the
+/// worker's.
+#[cfg(test)]
+pub(crate) mod test_offers {
+    use super::*;
+
+    pub const CALL_ID: &str = "3EB0CALLID";
+    pub const CREATOR: &str = "200000000000001@lid";
+
+    pub const GROUP: &str = "120363000000000001@g.us";
+
+    /// One member on a group call's roster, by privacy id, joined or only asked.
+    pub fn member(lid: &str, joined: bool) -> GroupCallParticipant {
+        let mut person =
+            GroupCallParticipant::new(format!("{lid}@lid").parse().unwrap(), Vec::new());
+        person.state = joined.then(|| "connected".to_owned());
+        person
+    }
+
+    pub fn roster(transaction: u32, participants: Vec<GroupCallParticipant>) -> GroupCallUpdate {
+        GroupCallUpdate::builder()
+            .call_id(CALL_ID.to_owned())
+            .call_creator(CREATOR.parse::<Jid>().unwrap())
+            .group_jid(GROUP.parse().unwrap())
+            .transaction_id(transaction)
+            .media("audio".to_owned())
+            .connected_limit(32)
+            .joinable(true)
+            .av_upgradable(false)
+            .rekey_requested(false)
+            .participants(participants)
+            .build()
+    }
+
+    /// A group's offer as it rings here: sent by the member who started the call, naming the
+    /// group and carrying the roster.
+    pub fn group_offer(participants: Vec<GroupCallParticipant>) -> IncomingCall {
+        IncomingCall::builder()
+            .from("200000000000001:3@lid".parse().unwrap())
+            .stanza_id("STANZA".to_owned())
+            .offline(false)
+            .action(CallAction::Offer {
+                call_id: CALL_ID.to_owned(),
+                call_creator: CREATOR.parse::<Jid>().unwrap(),
+                caller_pn: None,
+                caller_country_code: None,
+                device_class: None,
+                joinable: true,
+                is_video: false,
+                audio: Vec::new(),
+                group_jid: Some(GROUP.parse().unwrap()),
+            })
+            .group(Box::new(roster(1, participants)))
+            .build()
     }
 }

@@ -407,6 +407,10 @@ pub struct App {
     /// A sent message moves its chat up, so the chat list goes to the top,
     /// if it is near the top already (the list decides, from its offset).
     pub scroll_chats_to_top: bool,
+    /// Image URIs whose file changed under them, for egui to read afresh on
+    /// the next frame: it caches a picture by its URI for as long as it is
+    /// on screen, and a chat's picture keeps one file name across changes.
+    stale_images: Vec<String>,
     pub composer: String,
     composer_mentions: Vec<ComposerMention>,
     /// Byte offset of the `:` starting the active emoji query.
@@ -752,6 +756,10 @@ pub struct App {
     /// than made afresh for every frame.
     pub call_local_texture: Option<CallTexture>,
     pub call_remote_texture: Option<CallTexture>,
+    /// The newest picture of each group member whose video is arriving, by chat id, and the
+    /// texture each is drawn through.
+    pub call_member_frames: HashMap<String, std::sync::Arc<egui::ColorImage>>,
+    pub call_member_textures: HashMap<String, CallTexture>,
     /// Whether ZapFast starts at login, when this installation supports it.
     pub start_with_system: Option<bool>,
     /// Cross-thread window repaint handle.
@@ -1045,9 +1053,9 @@ const TRAY_SHOW: &str = "show";
 const TRAY_LOCK: &str = "lock";
 const TRAY_QUIT: &str = "quit";
 
-/// What a tray click asks for: a left click on Linux and macOS, or the menu's
-/// first entry, toggles the window; a left click on Windows and a Dock click
-/// on macOS show it.
+/// What a tray click asks for: a left click on Linux, or the menu's first
+/// entry, toggles the window; a left click on Windows and a Dock click on
+/// macOS show it. Clicking the macOS menu-bar icon opens its menu.
 fn tray_action(event: fastframe_tray::Event, window_hidden: bool) -> Option<Action> {
     use fastframe_tray::Event;
     Some(match event {
@@ -1076,8 +1084,6 @@ fn tray_config(lockable: bool) -> fastframe_tray::Config {
         // The tray icon is the app icon, so hosts that draw only named icons
         // may use the installed one.
         themed_icon: true,
-        // A left click on macOS toggles the window, as on Linux.
-        menu_on_click: false,
         menu: vec![
             MenuItem::action(TRAY_SHOW, "Show or hide ZapFast"),
             MenuItem::action(TRAY_LOCK, "Lock ZapFast").visible(lockable),
@@ -1146,7 +1152,9 @@ impl App {
         let mut app = Self::with_accounts(dirs, settings, roster, accounts, active, waker.clone());
         app.pauses_media = true;
         app.call_tones = crate::call_tones::Tones::new(true);
-        app.badge = Some(Default::default());
+        app.badge = Some(crate::notify::Badge::new(fastframe_desktop::desktop_entry(
+            "zapfast",
+        )));
         app.custom_themes
             .enable_desktop_themes(crate::theme::DESKTOP_THEMES);
         app.load_custom_themes();
@@ -1296,6 +1304,7 @@ impl App {
             zoom_applied: false,
             wallpaper_image: crate::wallpaper::CustomImage::default(),
             scroll_chats_to_top: false,
+            stale_images: Vec::new(),
             composer: String::new(),
             composer_mentions: Vec::new(),
             emoji_start: None,
@@ -1459,6 +1468,8 @@ impl App {
             call_remote_frame: None,
             call_local_texture: None,
             call_remote_texture: None,
+            call_member_frames: HashMap::new(),
+            call_member_textures: HashMap::new(),
             start_with_system: None,
             waker,
             tray: None,
@@ -3106,7 +3117,11 @@ impl App {
             }
             Event::Call(update) => self.handle_call_update(*update),
             Event::CallDevices(devices) => self.call_devices = *devices,
-            Event::CallVideo { local, remote } => self.handle_call_video(local, remote),
+            Event::CallVideo {
+                local,
+                remote,
+                from,
+            } => self.handle_call_video(local, remote, from),
             Event::CallLog(entries) => {
                 self.call_log = entries;
                 self.call_log_loaded = true;
@@ -3540,13 +3555,22 @@ impl App {
                 self.presence.insert(id, Presence { online, last_seen });
             }
             Event::Avatar { id, full, path } => {
-                if full {
+                // A changed picture arrives under the file name of the one it
+                // replaces, which egui would otherwise keep showing.
+                self.stale_images
+                    .extend(path.iter().map(|path| crate::util::image_uri(path)));
+                let previous = if full {
                     self.avatar_full_requests.remove(&id);
-                    self.avatars_full.insert(id, path);
+                    self.avatars_full.insert(id, path)
                 } else {
                     self.avatar_requests.remove(&id);
-                    self.avatars.insert(id, path);
-                }
+                    self.avatars.insert(id, path)
+                };
+                self.stale_images.extend(
+                    previous
+                        .flatten()
+                        .map(|previous| crate::util::image_uri(&previous)),
+                );
             }
             Event::Gifs { query, results } => {
                 if query == self.gif_query {
@@ -6580,7 +6604,9 @@ impl App {
                 }
             }
             Action::OpenUrl(url) => {
-                if let Some(code) = crate::safety::group_invite_code(&url) {
+                if let Some((token, video)) = crate::safety::call_link(&url) {
+                    self.join_call_link(token, video);
+                } else if let Some(code) = crate::safety::group_invite_code(&url) {
                     self.invite = Some(crate::model::GroupInvite {
                         code: code.clone(),
                         state: crate::model::InviteState::Loading,
@@ -8431,6 +8457,9 @@ impl App {
         self.wallpaper_image.sync(wallpaper.as_deref(), &self.waker);
         self.handle_notification_opens();
         self.handle_events();
+        for uri in std::mem::take(&mut self.stale_images) {
+            crate::image_cache::forget(ctx, &uri);
+        }
         self.tick(ctx);
         self.tick_audio(ctx);
         self.tick_video(ctx);
@@ -9175,9 +9204,17 @@ impl App {
             ctx.data_mut(|data| data.insert_temp(drop_id, frame));
             self.stage_clipboard(ctx, ClipboardPaste::Files(dropped));
         }
+        // A text paste reads the clipboard too, and finding no file or
+        // picture there is then nothing to report.
+        let text = ctx.input(|input| {
+            input
+                .events
+                .iter()
+                .any(|event| matches!(event, egui::Event::Paste(_)))
+        });
         // Tests inject fixtures and must never read the system clipboard.
         self.take_clipboard_paste(ctx, || {
-            if cfg!(test) {
+            let contents = if cfg!(test) {
                 clipboard_contents(
                     || {
                         ctx.data_mut(|data| {
@@ -9185,6 +9222,7 @@ impl App {
                                 "fixture-clipboard-files",
                             ))
                         })
+                        .ok_or_else(|| "no fixture files".to_owned())
                     },
                     || {
                         ctx.data_mut(|data| {
@@ -9192,11 +9230,20 @@ impl App {
                                 "fixture-clipboard-image",
                             ))
                         })
+                        .ok_or_else(|| "no fixture picture".to_owned())
                     },
                 )
             } else {
                 clipboard_contents(clipboard_files, clipboard_image)
-            }
+            };
+            contents
+                .inspect_err(|why| {
+                    if !text {
+                        // Only the reason: never the paths or the pixels.
+                        log::info!("Ctrl+V found nothing to attach: {why}");
+                    }
+                })
+                .ok()
         });
     }
 
@@ -9540,46 +9587,66 @@ enum ClipboardPaste {
 /// Prefers the clipboard's file list over its picture: Finder, Explorer and
 /// Linux file managers offer the file's icon as an image alongside the path,
 /// so a copied PDF or ZIP would otherwise arrive as its icon (#285).
+///
+/// Says why when there is neither, without naming any file, so a paste that
+/// stages nothing leaves its reason in the log (#404).
 fn clipboard_contents(
-    read_files: impl FnOnce() -> Option<Vec<PathBuf>>,
-    read_image: impl FnOnce() -> Option<(usize, usize, Vec<u8>)>,
-) -> Option<ClipboardPaste> {
-    let files: Vec<PathBuf> = read_files()
-        .unwrap_or_default()
-        .into_iter()
-        .filter_map(|path| {
-            // text/uri-list lines end in CRLF, and arboard splits only on LF.
-            let path = match path.to_str() {
-                Some(text) if text.ends_with('\r') => PathBuf::from(text.trim_end_matches('\r')),
-                _ => path,
-            };
-            path.exists().then_some(path)
+    read_files: impl FnOnce() -> Result<Vec<PathBuf>, String>,
+    read_image: impl FnOnce() -> Result<(usize, usize, Vec<u8>), String>,
+) -> Result<ClipboardPaste, String> {
+    let listed = read_files();
+    let files: Vec<PathBuf> = listed
+        .as_ref()
+        .map(|paths| {
+            paths
+                .iter()
+                .filter_map(|path| {
+                    // text/uri-list lines end in CRLF, and arboard splits only on LF.
+                    let path = match path.to_str() {
+                        Some(text) if text.ends_with('\r') => {
+                            PathBuf::from(text.trim_end_matches('\r'))
+                        }
+                        _ => path.clone(),
+                    };
+                    path.exists().then_some(path)
+                })
+                .collect()
         })
-        .collect();
+        .unwrap_or_default();
     if !files.is_empty() {
-        return Some(ClipboardPaste::Files(files));
+        return Ok(ClipboardPaste::Files(files));
     }
-    read_image().map(|(width, height, rgba)| ClipboardPaste::Image {
-        width,
-        height,
-        rgba,
-    })
+    let files = match &listed {
+        Ok(paths) => format!("{} copied files, none found on disk", paths.len()),
+        Err(why) => format!("no copied files ({why})"),
+    };
+    match read_image() {
+        Ok((width, height, rgba)) => Ok(ClipboardPaste::Image {
+            width,
+            height,
+            rgba,
+        }),
+        Err(why) => Err(format!("{files}, no picture ({why})")),
+    }
 }
 
 /// Files copied to the clipboard by a file manager.
-fn clipboard_files() -> Option<Vec<PathBuf>> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    clipboard.get().file_list().ok()
+fn clipboard_files() -> Result<Vec<PathBuf>, String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    clipboard
+        .get()
+        .file_list()
+        .map_err(|error| error.to_string())
 }
 
 /// Clipboard image as width, height, and straight-alpha RGBA.
-fn clipboard_image() -> Option<(usize, usize, Vec<u8>)> {
-    let mut clipboard = arboard::Clipboard::new().ok()?;
-    let image = clipboard.get_image().ok()?;
+fn clipboard_image() -> Result<(usize, usize, Vec<u8>), String> {
+    let mut clipboard = arboard::Clipboard::new().map_err(|error| error.to_string())?;
+    let image = clipboard.get_image().map_err(|error| error.to_string())?;
     if image.width == 0 || image.height == 0 {
-        return None;
+        return Err("the picture is empty".to_owned());
     }
-    Some((image.width, image.height, image.bytes.into_owned()))
+    Ok((image.width, image.height, image.bytes.into_owned()))
 }
 
 /// Writes decoded straight-alpha RGBA image bytes to the system clipboard.
@@ -9690,6 +9757,7 @@ fn notification_eligible(chat: &Chat, now: i64, message_at: i64) -> bool {
 }
 
 mod calls;
+pub use calls::CallPerson;
 
 #[cfg(test)]
 mod tests {
@@ -12279,12 +12347,15 @@ mod tests {
                 app.take_clipboard_paste(ui.ctx(), || {
                     reads += 1;
                     clipboard_contents(
-                        || files.clone(),
+                        || files.clone().ok_or_else(|| "no fixture files".to_owned()),
                         || {
                             image_reads += 1;
-                            image.then(|| (2, 2, vec![200; 16]))
+                            image
+                                .then(|| (2, 2, vec![200; 16]))
+                                .ok_or_else(|| "no fixture picture".to_owned())
                         },
                     )
+                    .ok()
                 });
                 ui.add(
                     egui::TextEdit::singleline(&mut app.composer)
@@ -12767,8 +12838,76 @@ mod tests {
         std::fs::write(&file, b"PK-fixture").unwrap();
         let mut listed = file.clone().into_os_string();
         listed.push("\r");
-        let contents = clipboard_contents(|| Some(vec![PathBuf::from(listed)]), || None);
-        assert!(matches!(contents, Some(ClipboardPaste::Files(paths)) if paths == [file]));
+        let contents = clipboard_contents(
+            || Ok(vec![PathBuf::from(listed)]),
+            || Err("no fixture picture".to_owned()),
+        );
+        assert!(matches!(contents, Ok(ClipboardPaste::Files(paths)) if paths == [file]));
+    }
+
+    /// A file copied in Explorer and pasted with a quick Ctrl+V right after
+    /// switching back (#404): egui-winit swallows the V press while it looks
+    /// for text that is not there, so only the V release arrives, after Ctrl
+    /// already went up, and a chat row clicked to get here may still hold the
+    /// focus. Explorer offers the file's icon too, and the file must win.
+    #[test]
+    fn a_file_copied_in_explorer_pastes_on_a_quick_tap_after_switching_back() {
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("fixture report.pdf");
+        std::fs::write(&file, b"%PDF-fixture").unwrap();
+        let (mut app, ctx) = clipboard_app();
+        ctx.memory_mut(|memory| memory.request_focus(egui::Id::new("fixture-chat-row")));
+        let up = egui::Event::ModifiersChanged(egui::Modifiers::NONE);
+        let down = egui::Event::ModifiersChanged(egui::Modifiers::COMMAND);
+        let mut reads = 0;
+        for (time, events) in [
+            (10.0, vec![egui::Event::WindowFocused(true), up.clone()]),
+            (10.5, vec![down]),
+            (10.6, vec![up, bare_v_release()]),
+        ] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    time: Some(time),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    app.take_clipboard_paste(ui.ctx(), || {
+                        reads += 1;
+                        clipboard_contents(|| Ok(vec![file.clone()]), || Ok((2, 2, vec![200; 16])))
+                            .ok()
+                    });
+                    app.apply_actions(ui.ctx());
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert_eq!(reads, 1);
+        assert_eq!(app.pending.len(), 1);
+        assert!(matches!(&app.pending[0].item, Pending::File(path) if *path == file));
+    }
+
+    /// A paste that finds nothing says why for the log, naming no file.
+    #[test]
+    fn an_empty_paste_explains_itself_without_naming_files() {
+        let missing = PathBuf::from("/fixture/secret-name.pdf");
+        let why = clipboard_contents(
+            || Ok(vec![missing.clone()]),
+            || Err("no picture here".to_owned()),
+        )
+        .unwrap_err();
+        assert!(why.contains("1 copied files, none found on disk"), "{why}");
+        assert!(why.contains("no picture here"), "{why}");
+        assert!(!why.contains("secret-name"), "{why}");
+        let why = clipboard_contents(
+            || Err("format unavailable".to_owned()),
+            || Err("empty".to_owned()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            why,
+            "no copied files (format unavailable), no picture (empty)"
+        );
     }
 
     #[test]
@@ -18578,6 +18717,44 @@ mod tests {
         frame(&mut app);
         assert!(app.info_visible());
         assert!(!registered(&uri("kept")), "the first chat's go too");
+    }
+
+    /// A chat's new picture arrives under the file name of its old one, and
+    /// the window reads it afresh instead of keeping the old one it loaded.
+    #[test]
+    fn a_changed_chat_picture_is_read_again() {
+        let mut app = app();
+        let (backend, _commands, events) = Backend::recording_with_events();
+        app.backend = backend;
+        let ctx = egui::Context::default();
+        app.attach(&ctx);
+        let group = "fixture@g.us";
+        let path = std::path::PathBuf::from("/cache/avatars/fixture.jpg");
+        let uri = crate::util::image_uri(&path);
+        let picture = |events: &std::sync::mpsc::Sender<Event>| {
+            events
+                .send(Event::Avatar {
+                    id: group.into(),
+                    full: false,
+                    path: Some(path.clone()),
+                })
+                .unwrap();
+        };
+        picture(&events);
+        app.background_frame(&ctx);
+        crate::image_cache::include(&ctx, &uri, b"old picture");
+        assert!(
+            ctx.try_load_bytes(&uri).is_ok(),
+            "the old picture is loaded"
+        );
+        picture(&events);
+        app.background_frame(&ctx);
+        let old = matches!(
+            ctx.try_load_bytes(&uri),
+            Ok(egui::load::BytesPoll::Ready { bytes, .. }) if bytes.as_ref() == b"old picture"
+        );
+        assert!(!old, "the old picture is gone, so the new file is read");
+        assert_eq!(app.avatars.get(group), Some(&Some(path)));
     }
 
     /// A picture a listing drops and the next one lists again, before the

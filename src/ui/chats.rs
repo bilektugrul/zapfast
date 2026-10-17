@@ -1767,9 +1767,12 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
         return;
     }
     let chats: Vec<Chat> = app.visible_chats().into_iter().cloned().collect();
+    // Exactly the height the rail gives it: egui's least scrolled height
+    // would reach past the window's bottom in a short one.
     let mut scroll_area = egui::ScrollArea::vertical()
         .id_salt("chat-rail")
-        .auto_shrink([false, false]);
+        .auto_shrink([false, false])
+        .min_scrolled_height(0.0);
     if to_top && near_top(ui, "chat-rail", COMPACT_CELL) {
         scroll_area = scroll_area.vertical_scroll_offset(0.0);
     }
@@ -1810,6 +1813,7 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
     };
     // Only the avatars on screen are laid out, however many chats there are.
     let output = scroll_area.show_rows(ui, COMPACT_CELL, chats.len(), |ui, range| {
+        let mut focused = None;
         if carried != 0.0 {
             ui.scroll_with_delta_animation(
                 vec2(0.0, carried),
@@ -1823,8 +1827,20 @@ pub(super) fn compact_list(app: &mut App, ui: &mut egui::Ui) {
             if response.clicked() && !app.locked_folder_open() && !app.show_archived {
                 app.actions.push(Action::KeepUnread(chat.id.clone()));
             }
+            if response.has_focus() {
+                focused = Some(response);
+            }
         }
+        focused
     });
+    // The rail itself scrolls in a short window. The inner scroll area has
+    // consumed the avatar's focus target; reveal its viewport in the outer
+    // one as well, so a focused avatar cannot stay clipped by the rail.
+    if let Some(mut focused) = output.inner {
+        focused.rect = output.inner_rect;
+        focused.interact_rect = focused.rect.intersect(ui.clip_rect());
+        theme::reveal_focus_in(ui, &focused);
+    }
     if !copy {
         ui.ctx().data_mut(|data| {
             data.insert_temp(shared_offset_id().with("rail"), output.state.offset.y);
@@ -1897,7 +1913,8 @@ fn compact_row(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> egui::Response 
     let selected = app.open_chat.as_deref() == Some(chat.id.as_str());
     let (rect, response) =
         ui.allocate_exact_size(vec2(ui.available_width(), COMPACT_CELL), Sense::click());
-    theme::reveal_focus(&response);
+    // A short window leaves the rail's avatars little more than one row.
+    theme::reveal_focus_in(ui, &response);
     response.widget_info(|| {
         egui::WidgetInfo::selected(
             egui::WidgetType::SelectableLabel,

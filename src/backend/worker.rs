@@ -193,7 +193,11 @@ async fn fetch_attachment(
         .map_err(|error| error.to_string())?;
     let (temporary, file) = temporary_attachment_file(path)?;
     let result = client
-        .download_to_writer(downloadable, LimitedWriter::new(file, limit))
+        .download_to_writer(
+            downloadable,
+            LimitedWriter::new(file, limit),
+            Default::default(),
+        )
         .await;
     match result {
         Ok(writer) => {
@@ -423,6 +427,30 @@ pub const PLUS_PINNED_CHATS: usize = 20;
 
 /// Seven days: the pin length WhatsApp offers for a message pinned in a chat.
 const PIN_SECS: i64 = 7 * 24 * 60 * 60;
+/// Says in the log whether WhatsApp lets this device start calls, and group
+/// calls in particular. WhatsApp Web shows group calling only while the server
+/// turns on `enable_web_group_calling` for the account, and a group offer from
+/// a device it is off for is refused with 427 ("group call not enabled"). Two
+/// flags, no personal data; asked like the pin limit, for want of an event.
+fn spawn_calling_gate_log(client: Arc<Client>) {
+    tokio::spawn(async move {
+        for _ in 0..30 {
+            let calling = client
+                .ab_prop_enabled(abprops::web::ENABLE_WEB_CALLING)
+                .await;
+            let group = client
+                .ab_prop_enabled(abprops::web::ENABLE_WEB_GROUP_CALLING)
+                .await;
+            if let (Some(calling), Some(group)) = (calling, group) {
+                log::info!("[CALL] web calling enabled={calling} group calling enabled={group}");
+                return;
+            }
+            tokio::time::sleep(Duration::from_secs(2)).await;
+        }
+        log::info!("[CALL] web calling flags never arrived");
+    });
+}
+
 /// Reports how many chats this account may pin. The AB props arrive shortly
 /// after connecting and there is no event for them, so this polls briefly.
 fn spawn_pin_limit_check(
@@ -699,6 +727,7 @@ pub async fn run(
         group_info_requested: HashSet::new(),
         leave_generation: HashMap::new(),
         subject_generation: HashMap::new(),
+        group_pictures_sent: HashMap::new(),
         description_generation: HashMap::new(),
         group_info_generation: HashMap::new(),
         edits: HashMap::new(),
@@ -1098,6 +1127,10 @@ struct Worker {
     /// Bumped whenever a rename made here is confirmed, for the same reason:
     /// metadata asked for before it must not bring the old subject back.
     subject_generation: HashMap<String, u64>,
+    /// The photo each group was last sent, kept until WhatsApp answers so an
+    /// accepted one shows at once rather than after a lookup the server may
+    /// still answer with the old picture.
+    group_pictures_sent: HashMap<ChatId, Vec<u8>>,
     /// Description notices must outlive metadata requested before they arrived.
     description_generation: HashMap<String, u64>,
     /// Superseded metadata operations cannot update the archive or retry queue.
@@ -2322,7 +2355,11 @@ impl Worker {
         };
         let sender = self.wa_sender.clone();
         let builder = host_owned_presence(Bot::builder().with_backend(store))
-            .with_watched_ab_props([abprops::web::AURA_PINNED_CHATS_BENEFIT_ACTIVE]);
+            .with_watched_ab_props([
+                abprops::web::AURA_PINNED_CHATS_BENEFIT_ACTIVE,
+                abprops::web::ENABLE_WEB_CALLING,
+                abprops::web::ENABLE_WEB_GROUP_CALLING,
+            ]);
         let builder = match crate::proxy::for_whatsapp() {
             Some(proxy) => {
                 log::info!("connecting through the proxy {}", proxy.redacted());
@@ -3092,8 +3129,11 @@ impl Worker {
             // that moves a call out of dialing, never the fact that dialing started.
             E::IncomingCall(call) => self.call_signaling(call).await,
             E::MissedCall(call) => {
-                self.call_resolved(&call.call_id, None);
-                self.missed_call_entry(call);
+                // A call that rang here is filed as it ends, under its own chat (a group call's
+                // under its group); the notice is filed only for a call this device never rang.
+                if !self.call_resolved(&call.call_id, None) {
+                    self.missed_call_entry(call);
+                }
             }
             E::CallLogSync(sync) => self.call_log_entry(
                 &sync.call_id,
@@ -3111,15 +3151,17 @@ impl Worker {
                     );
                 }
             }
-            E::CallEndedElsewhere(call) => self.call_resolved(
-                &call.call_id,
-                Some(match call.outcome {
-                    whatsapp_rust::types::call::ElsewhereOutcome::Rejected => {
-                        crate::calls::CallOutcome::DeclinedElsewhere
-                    }
-                    _ => crate::calls::CallOutcome::AnsweredElsewhere,
-                }),
-            ),
+            E::CallEndedElsewhere(call) => {
+                self.call_resolved(
+                    &call.call_id,
+                    Some(match call.outcome {
+                        whatsapp_rust::types::call::ElsewhereOutcome::Rejected => {
+                            crate::calls::CallOutcome::DeclinedElsewhere
+                        }
+                        _ => crate::calls::CallOutcome::AnsweredElsewhere,
+                    }),
+                );
+            }
             E::PairingQrCode(qr) => {
                 // The prefix lets the phone camera open WhatsApp at Linked devices.
                 self.qr = Some(format!("{NATIVE_CAMERA_DEEP_LINK_PREFIX}{}", qr.code));
@@ -3188,6 +3230,7 @@ impl Worker {
                     self.presence_refresh_pending = false;
                     self.announce_presence(self.online_wanted);
                     spawn_pin_limit_check(client.clone(), self.events.clone(), self.waker.clone());
+                    spawn_calling_gate_log(client.clone());
                     let channels = self.commands.clone();
                     let followed = client.clone();
                     tokio::spawn(async move {
@@ -5862,6 +5905,12 @@ impl Worker {
                 generation,
                 cancel,
             } => self.start_call(chat, video, generation, cancel).await,
+            Command::JoinCallLink {
+                token,
+                video,
+                generation,
+                cancel,
+            } => self.join_call_link(token, video, generation, cancel).await,
             Command::AnswerCall => self.answer_call().await,
             Command::DeclineCall => self.decline_call().await,
             Command::HangupCall => self.hangup_call().await,
@@ -7571,6 +7620,10 @@ impl Worker {
             chat: chat.clone(),
             saving: true,
         });
+        match &jpeg {
+            Some(jpeg) => self.group_pictures_sent.insert(chat.clone(), jpeg.clone()),
+            None => self.group_pictures_sent.remove(&chat),
+        };
         let commands = self.commands.clone();
         let waker = self.waker.clone();
         tokio::spawn(async move {
@@ -7596,12 +7649,19 @@ impl Worker {
             chat: chat.clone(),
             saving: false,
         });
+        let sent_picture = match edit {
+            GroupEdit::Picture { .. } => self.group_pictures_sent.remove(&chat),
+            GroupEdit::Name(_) => None,
+        };
         match (result, edit) {
             (Ok(()), GroupEdit::Name(name)) => {
                 // Metadata asked for before now may still name the old subject.
                 *self.subject_generation.entry(chat.clone()).or_default() += 1;
                 let _ = self.archive.rename_chat(&chat, &name);
                 self.emit_chat(&chat);
+            }
+            (Ok(()), GroupEdit::Picture { removed: false }) if sent_picture.is_some() => {
+                self.show_sent_picture(chat, sent_picture.unwrap_or_default());
             }
             (Ok(()), GroupEdit::Picture { removed }) => self.refresh_avatar(chat, removed),
             (Err(error), edit) => {
@@ -8890,6 +8950,31 @@ impl Worker {
         } else {
             self.fetch_avatar(id.clone(), false);
             self.fetch_avatar(id, true);
+        }
+    }
+
+    /// Shows a picture WhatsApp just accepted from us as the chat's own, in
+    /// both sizes, without asking the server for it back: a lookup right after
+    /// the change can still answer with the old one. The cached copies stay
+    /// fresh for [`AVATAR_FRESH`] like any fetched picture.
+    fn show_sent_picture(&mut self, id: String, jpeg: Vec<u8>) {
+        for full in [false, true] {
+            let path = self.avatar_file(&id, full);
+            let written = path
+                .parent()
+                .map_or(Ok(()), std::fs::create_dir_all)
+                .and_then(|()| std::fs::write(&path, &jpeg));
+            if written.is_err() {
+                // The server has it either way.
+                let _ = std::fs::remove_file(&path);
+                self.fetch_avatar(id.clone(), full);
+                continue;
+            }
+            self.emit(Event::Avatar {
+                id: id.clone(),
+                full,
+                path: Some(path),
+            });
         }
     }
 
@@ -15968,6 +16053,53 @@ mod receipt_tests {
         assert_eq!(cleared, vec![false, true]);
     }
 
+    /// A photo WhatsApp accepted from us shows in both sizes from the bytes
+    /// we sent, at once, without a lookup the server may still answer with
+    /// the old picture. One it refused is forgotten.
+    #[tokio::test]
+    async fn an_accepted_group_photo_shows_what_was_sent() {
+        let (mut worker, events, _inbox, _wa) = worker();
+        let chat = "fixture@g.us";
+        let jpeg = b"\xff\xd8 new photo".to_vec();
+        worker.group_pictures_sent.insert(chat.into(), jpeg.clone());
+        worker
+            .handle_command(Command::GroupEdited {
+                chat: chat.into(),
+                edit: GroupEdit::Picture { removed: false },
+                result: Ok(()),
+            })
+            .await;
+        let shown: Vec<(bool, PathBuf)> = events
+            .try_iter()
+            .filter_map(|event| match event {
+                Event::Avatar {
+                    id,
+                    full,
+                    path: Some(path),
+                } if id == chat => Some((full, path)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            shown.iter().map(|(full, _)| *full).collect::<Vec<_>>(),
+            vec![false, true]
+        );
+        for (_, path) in &shown {
+            assert_eq!(std::fs::read(path).unwrap(), jpeg);
+        }
+        assert!(worker.group_pictures_sent.is_empty());
+
+        worker.group_pictures_sent.insert(chat.into(), jpeg.clone());
+        worker
+            .handle_command(Command::GroupEdited {
+                chat: chat.into(),
+                edit: GroupEdit::Picture { removed: false },
+                result: Err("IQ request timed out".into()),
+            })
+            .await;
+        assert!(worker.group_pictures_sent.is_empty());
+    }
+
     #[test]
     fn refused_group_edits_are_told_from_failures() {
         assert!(group_edit_refused(
@@ -16394,6 +16526,7 @@ mod receipt_tests {
             group_info_requested: HashSet::new(),
             leave_generation: HashMap::new(),
             subject_generation: HashMap::new(),
+            group_pictures_sent: HashMap::new(),
             description_generation: HashMap::new(),
             group_info_generation: HashMap::new(),
             edits: HashMap::new(),

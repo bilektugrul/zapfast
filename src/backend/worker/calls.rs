@@ -37,6 +37,8 @@ pub(super) enum CallRuntimeEvent {
     Media(CallEvent),
     /// The media task is gone: relay disconnect, send failure, or hangup.
     Ended,
+    /// A call link's join finished: the call is in, or why it is not.
+    LinkJoined(Result<whatsapp_rust::voip::CallHandle, String>),
 }
 
 impl CallRuntime {
@@ -44,6 +46,22 @@ impl CallRuntime {
     /// to watch, and gets one the moment it is placed or answered.
     pub(super) fn new(call: Call, frames: Option<async_channel::Receiver<VideoTick>>) -> Self {
         let (_tx, events) = async_channel::bounded(64);
+        let last = call.update();
+        Self {
+            call,
+            events,
+            frames,
+            watching: false,
+            last,
+        }
+    }
+
+    /// A call link's runtime, whose events are its join's answer until it has a handle to watch.
+    fn joining(
+        call: Call,
+        frames: Option<async_channel::Receiver<VideoTick>>,
+        events: async_channel::Receiver<CallRuntimeEvent>,
+    ) -> Self {
         let last = call.update();
         Self {
             call,
@@ -136,6 +154,7 @@ impl Worker {
     /// The UI keeps rendering the snapshot it was handed; what is released here is the media, so a
     /// finished call holds no child process and no task.
     pub(super) fn emit_call(&mut self, update: CallUpdate) {
+        let update = self.canonical_call(update);
         let finished = !update.phase.is_live();
         // Remembered so the periodic check can tell a real change from a snapshot it already sent.
         if let Some(runtime) = self.call.as_mut()
@@ -155,6 +174,21 @@ impl Worker {
         {
             self.file_finished_call(&runtime.call, &update);
         }
+    }
+
+    /// Files a group call's people under the chat ids the rest of the app uses, as every other
+    /// `Jid` that reaches the window is: a privacy id becomes the phone number once it is known. Our
+    /// own entry on the roster is left out, since the call screen draws the others.
+    fn canonical_call(&self, mut update: CallUpdate) -> CallUpdate {
+        if let Some(group) = update.group.as_mut() {
+            group.caller = group.caller.as_deref().map(|id| self.canonical_str(id));
+            for person in &mut group.participants {
+                person.id = self.canonical_str(&person.id);
+            }
+            let me = self.me();
+            group.participants.retain(|person| person.id != me);
+        }
+        update
     }
 
     /// Whether a call is already up, which every entry point refuses to double.
@@ -238,6 +272,73 @@ impl Worker {
                 log::error!("[CALL] could not start the call: {error}");
                 self.emit(Event::Error(format!(
                     "The call could not be started: {error}"
+                )));
+                self.emit_call(placing.not_placed());
+            }
+        }
+    }
+
+    /// Joins a call link the window is already showing as placing under `generation`.
+    ///
+    /// The join itself runs on a task of its own (the call service may hold us in its waiting
+    /// room), and its answer comes back as [`CallRuntimeEvent::LinkJoined`]. A call link belongs
+    /// to no chat, so it is drawn under its roster and filed nowhere.
+    pub(super) async fn join_call_link(
+        &mut self,
+        token: String,
+        video: bool,
+        generation: u64,
+        cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let mut placing = CallUpdate::placing(generation, String::new(), video);
+        placing.group = Some(calls::GroupCall {
+            link: true,
+            ..calls::GroupCall::default()
+        });
+        if self.call_busy() {
+            self.emit_call(placing.not_placed());
+            return;
+        }
+        let Some(client) = self.client.clone() else {
+            log::warn!("[CALL] cannot join a call link: WhatsApp is not connected");
+            self.emit(Event::Error(
+                "ZapFast is not connected to WhatsApp".to_owned(),
+            ));
+            self.emit_call(placing.not_placed());
+            return;
+        };
+        let devices = self.emit_call_devices().await;
+        let camera = video
+            .then(|| calls::default_camera(&devices, None))
+            .flatten();
+        let (done, answers) = async_channel::bounded(1);
+        let joined =
+            Call::join_link(&client, generation, token, video, camera, &cancel, done).await;
+        match joined {
+            Ok((call, frames)) => {
+                let (tx, events) = async_channel::bounded(1);
+                // The join's answer, as the runtime's first event.
+                tokio::spawn(async move {
+                    if let Ok(answer) = answers.recv().await {
+                        let _ = tx.send(CallRuntimeEvent::LinkJoined(answer)).await;
+                    }
+                });
+                let runtime = CallRuntime::joining(call, frames, events);
+                let update = runtime.call.update();
+                self.call = Some(runtime);
+                if cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                    self.hangup_call().await;
+                } else {
+                    self.emit_call(update);
+                }
+            }
+            Err(error) if error.is::<calls::Cancelled>() => {
+                self.emit_call(placing.not_placed());
+            }
+            Err(error) => {
+                log::error!("[CALL] could not join the call link: {error}");
+                self.emit(Event::Error(format!(
+                    "The call link could not be joined: {error}"
                 )));
                 self.emit_call(placing.not_placed());
             }
@@ -406,8 +507,15 @@ impl Worker {
 
     /// One event from the current call's media plane.
     pub(super) fn call_runtime(&mut self, event: CallRuntimeEvent) {
+        let mut refused = None;
         let update = match self.call.as_mut() {
             Some(runtime) => match event {
+                CallRuntimeEvent::LinkJoined(joined) => {
+                    refused = joined.as_ref().err().cloned();
+                    let update = runtime.call.link_joined(joined);
+                    runtime.watch();
+                    update
+                }
                 CallRuntimeEvent::Ended => runtime.call.media_ended(),
                 CallRuntimeEvent::Media(media) => {
                     if matches!(media, CallEvent::RelayAllocated)
@@ -422,6 +530,11 @@ impl Worker {
             },
             None => None,
         };
+        if let Some(error) = refused {
+            self.emit(Event::Error(format!(
+                "The call link could not be joined: {error}"
+            )));
+        }
         if let Some(update) = update {
             self.emit_call(update);
         }
@@ -439,7 +552,28 @@ impl Worker {
                 self.emit(Event::CallVideo {
                     local: Some(image),
                     remote: None,
+                    from: None,
                 });
+            }
+            VideoTick::RemoteFrom { sender, image } => {
+                // A group member's picture, for their own tile, under the id their tile has.
+                let Some((id, first)) = self
+                    .call
+                    .as_mut()
+                    .and_then(|runtime| runtime.call.group_picture(&sender))
+                else {
+                    return;
+                };
+                self.emit(Event::CallVideo {
+                    local: None,
+                    remote: Some(image),
+                    from: Some(self.canonical_str(&id)),
+                });
+                // Their tile turns from their photo to their picture.
+                if first && let Some(runtime) = self.call.as_ref() {
+                    let update = self.canonical_call(runtime.call.update());
+                    self.emit(Event::Call(Box::new(update)));
+                }
             }
             VideoTick::Remote(image) => {
                 let first = self
@@ -457,10 +591,11 @@ impl Worker {
                     self.emit(Event::CallVideo {
                         local: None,
                         remote: Some(image),
+                        from: None,
                     });
                 }
                 if first && let Some(runtime) = self.call.as_ref() {
-                    let update = runtime.call.update();
+                    let update = self.canonical_call(runtime.call.update());
                     self.emit(Event::Call(Box::new(update)));
                 }
             }
@@ -510,20 +645,28 @@ impl Worker {
             }
             return;
         }
-        let chat = self.canonical(&incoming.from);
-        // A group, broadcast or newsletter offer never reaches the 1:1 call surface. The interface
-        // hides the buttons for those chats, but the worker is the boundary: a non-direct offer is
-        // refused here rather than rung, so no call is created and no history entry is written.
+        // A group call rings under its group, as WhatsApp files it; a call among several people
+        // with no group behind it rings under the person who started it. Either way the roster the
+        // offer carried says who else is on it.
+        let group = calls::offer_is_group(incoming);
+        let chat = match calls::offer_group(incoming) {
+            Some(jid) => self.canonical(&jid),
+            None if group => self.canonical(&incoming.action.call_creator().to_non_ad()),
+            None => self.canonical(&incoming.from),
+        };
+        // A broadcast or newsletter offer never reaches the call surface, and neither does a
+        // group's offer that names something other than a group. The worker is the boundary: such
+        // an offer is refused here rather than rung, so no call is created and no history entry is
+        // written.
         //
         // Refuse it to the caller instead of only dropping it: a dropped offer leaves the other
         // side ringing until its own protocol timeout, believing this device might still answer,
-        // while a real `<reject>` ends it there and then. Only a 1:1 offer rings, so an offer that
-        // reaches here is one the caller is told we will not take.
-        if !callable_chat(&chat) {
+        // while a real `<reject>` ends it there and then.
+        if !rings_in(&chat, group) {
             match self.client.as_ref() {
                 Some(client) => match client.voip().reject(incoming).await {
                     Ok(()) => log::warn!(
-                        "[CALL] refused an incoming offer from a chat that is not one to one"
+                        "[CALL] refused an incoming offer from a chat that cannot be called group={group}"
                     ),
                     Err(error) => {
                         log::warn!("[CALL] a non-direct offer could not be refused: {error}")
@@ -543,9 +686,17 @@ impl Worker {
 
     /// A call we were ringing for was resolved on another of the account's devices (`elsewhere`
     /// says how), or the caller gave up before anyone answered (`None`).
-    pub(super) fn call_resolved(&mut self, call_id: &str, elsewhere: Option<calls::CallOutcome>) {
+    ///
+    /// Returns whether the call was this worker's own, which files its entry as it ends.
+    pub(super) fn call_resolved(
+        &mut self,
+        call_id: &str,
+        elsewhere: Option<calls::CallOutcome>,
+    ) -> bool {
+        let mut mine = false;
         let update = match self.call.as_mut() {
             Some(runtime) if runtime.call.call_id() == call_id => {
+                mine = true;
                 runtime.call.resolved_elsewhere(elsewhere)
             }
             _ => None,
@@ -553,12 +704,14 @@ impl Worker {
         if let Some(update) = update {
             self.emit_call(update);
         }
+        mine
     }
 
     /// Releases the call on the way out, so quitting leaves no child process or task behind.
     pub(super) async fn shutdown_call(&mut self) {
         if let Some(mut runtime) = self.call.take() {
             let update = runtime.call.hangup(self.client.as_ref()).await;
+            let update = self.canonical_call(update);
             // The window lets the call go as it lets any other finished one.
             self.emit(Event::Call(Box::new(update.clone())));
             self.file_finished_call(&runtime.call, &update);
@@ -627,12 +780,19 @@ impl Worker {
         }
         // Compared against the snapshot the UI was handed, so a camera that stopped on its own or a
         // mute another device set reaches the screen even though no user pressed anything.
-        let changed = self.call.as_mut().and_then(|runtime| {
-            let current = runtime.call.update();
-            let changed = current != runtime.last;
-            runtime.last = current.clone();
-            changed.then_some(current)
-        });
+        let current = self
+            .call
+            .as_ref()
+            .map(|runtime| self.canonical_call(runtime.call.update()));
+        let changed = self
+            .call
+            .as_mut()
+            .zip(current)
+            .and_then(|(runtime, current)| {
+                let changed = current != runtime.last;
+                runtime.last = current.clone();
+                changed.then_some(current)
+            });
         if let Some(update) = changed {
             self.emit_call(update);
         }
@@ -642,6 +802,9 @@ impl Worker {
 /// A call to file among a chat's messages.
 pub(super) struct CallEntry {
     pub chat: ChatId,
+    /// Who placed a call we did not: the chat itself for a one-to-one call, the member who rang
+    /// for a group's. `None` reads as the chat.
+    pub caller: Option<String>,
     pub call_id: String,
     pub from_me: bool,
     pub timestamp: i64,
@@ -672,11 +835,14 @@ impl Worker {
                 return;
             }
         }
-        self.ensure_chat(&entry.chat, None);
+        let link = entry.chat == crate::model::CALL_LINK_CHAT;
+        if !link {
+            self.ensure_chat(&entry.chat, None);
+        }
         let sender = if entry.from_me {
             self.me()
         } else {
-            entry.chat.clone()
+            entry.caller.clone().unwrap_or_else(|| entry.chat.clone())
         };
         let message = Message {
             id,
@@ -704,6 +870,11 @@ impl Worker {
         };
         if let Err(error) = self.archive.insert_message(&message, None) {
             log::warn!("[CALL] a call entry could not be filed: {error}");
+            return;
+        }
+        if link {
+            // No chat shows it: the Calls page is where it goes.
+            self.emit_call_log();
             return;
         }
         self.emit(Event::Messages {
@@ -750,8 +921,16 @@ impl Worker {
         let Some(status) = update.outcome else {
             return;
         };
+        // A call joined through a link belongs to no chat, and is filed under
+        // the id kept for such calls.
+        let link = update.group.as_ref().is_some_and(|group| group.link);
         self.file_call_entry(CallEntry {
-            chat: update.chat.clone(),
+            chat: if link {
+                crate::model::CALL_LINK_CHAT.to_owned()
+            } else {
+                update.chat.clone()
+            },
+            caller: update.group.as_ref().and_then(|group| group.caller.clone()),
             call_id: call.call_id().to_owned(),
             from_me: update.direction == crate::model::CallDirection::Outgoing,
             timestamp: call.began(),
@@ -760,15 +939,21 @@ impl Worker {
             duration: update
                 .started
                 .map_or(0, |started| started.elapsed().as_secs()),
-            group: false,
+            group: call.is_group(),
         });
     }
 
     /// Files a call the phone reports as missed while this device was away.
     pub(super) fn missed_call_entry(&mut self, call: &whatsapp_rust::types::call::MissedCall) {
+        // A group call's notice can come from the call service itself (`@call`), which is no chat
+        // to file it in; the phone's own call log files that one in its group.
+        if matches!(call.from.server, whatsapp_rust::prelude::Server::Call) {
+            return;
+        }
         let chat = self.canonical(&call.from);
         self.file_call_entry(CallEntry {
             chat,
+            caller: None,
             call_id: call.call_id.clone(),
             from_me: false,
             timestamp: call.timestamp.timestamp(),
@@ -816,8 +1001,13 @@ impl Worker {
                 None => return,
             },
         };
+        // The phone's record names who placed a group call it did not.
+        let caller = (group.is_some() && !from_me)
+            .then(|| creator.map(|creator| self.canonical(&creator.to_non_ad())))
+            .flatten();
         self.file_call_entry(CallEntry {
             chat,
+            caller,
             call_id: call_id.to_owned(),
             from_me,
             timestamp: record.start_time.unwrap_or(0),
@@ -922,9 +1112,148 @@ fn callable_chat(chat: &str) -> bool {
     )
 }
 
+/// Whether an offer may ring in `chat`: a one-to-one offer in a direct chat, a group call's in its
+/// group, or, for a call among several people with no group behind it, in its creator's chat.
+fn rings_in(chat: &str, group: bool) -> bool {
+    match crate::model::ChatKind::from_id(chat) {
+        crate::model::ChatKind::Direct => true,
+        crate::model::ChatKind::Group => group,
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A group call reaches the window under the app's own ids, without our own roster entry, and
+    /// is filed in its group, under the member who rang, once it is over.
+    #[test]
+    fn a_group_call_is_drawn_and_filed_under_its_group() {
+        use crate::calls::test_offers::{GROUP, group_offer, member};
+        let (mut worker, events, _, _) = super::super::receipt_tests::worker();
+        worker.archive.ensure_chat(GROUP, "Book club").unwrap();
+        // The caller's privacy id is known to be this phone number; ours is our own.
+        worker
+            .lid_to_pn
+            .insert("200000000000001".to_owned(), "15550002222".to_owned());
+        worker.me_lid = Some("200000000000009@lid".to_owned());
+        let incoming = group_offer(vec![
+            member("200000000000001", true),
+            member("200000000000002", true),
+            member("200000000000009", true),
+        ]);
+        let call = Call::ringing(GROUP.to_owned(), Box::new(incoming), false);
+        let update = call.update();
+        worker.call = Some(CallRuntime::new(call, None));
+        worker.emit_call(update);
+        let drawn = events
+            .try_iter()
+            .find_map(|event| match event {
+                Event::Call(update) => Some(update),
+                _ => None,
+            })
+            .expect("the call rings");
+        assert_eq!(drawn.chat, GROUP);
+        let group = drawn.group.expect("a group call");
+        assert_eq!(group.caller.as_deref(), Some("15550002222@s.whatsapp.net"));
+        let ids: Vec<&str> = group.participants.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            ["15550002222@s.whatsapp.net", "200000000000002@lid"],
+            "named by phone number where known, and without us"
+        );
+
+        // A member's picture reaches the window under their chat id, and turns their tile.
+        let image = std::sync::Arc::new(egui::ColorImage::filled([2, 2], egui::Color32::BLACK));
+        worker.call_frame(VideoTick::RemoteFrom {
+            sender: "200000000000001:5@lid".parse().unwrap(),
+            image,
+        });
+        let events: Vec<Event> = events.try_iter().collect();
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::CallVideo { from: Some(id), remote: Some(_), .. }
+                if id == "15550002222@s.whatsapp.net"
+        )));
+        assert!(events.iter().any(|event| matches!(
+            event,
+            Event::Call(update) if update.group.as_ref().is_some_and(|group| group.participants[0].video)
+        )));
+
+        // The caller gives up before we answer: a missed group call, in the group.
+        assert!(worker.call_resolved(crate::calls::test_offers::CALL_ID, None));
+        let filed = worker.archive.call_log(10).unwrap();
+        assert_eq!(filed.len(), 1);
+        let entry = &filed[0];
+        assert_eq!(entry.chat, GROUP);
+        assert_eq!(entry.sender, "15550002222@s.whatsapp.net");
+        assert!(!entry.from_me);
+        assert!(matches!(
+            entry.content,
+            Content::Call {
+                group: true,
+                status: calls::CallOutcome::Missed,
+                ..
+            }
+        ));
+    }
+
+    /// A call joined through a link is filed under the id kept for such calls, which no chat
+    /// has, and reaches the Calls page without making a chat of it.
+    #[test]
+    fn a_call_link_call_is_filed_for_the_calls_page_only() {
+        let (mut worker, events, _, _) = super::super::receipt_tests::worker();
+        worker.file_call_entry(CallEntry {
+            chat: crate::model::CALL_LINK_CHAT.to_owned(),
+            caller: None,
+            call_id: "LINKCALL".to_owned(),
+            from_me: true,
+            timestamp: 1_000,
+            video: true,
+            status: calls::CallOutcome::Answered,
+            duration: 75,
+            group: true,
+        });
+        let filed = worker.archive.call_log(10).unwrap();
+        assert_eq!(filed.len(), 1);
+        assert_eq!(filed[0].chat, crate::model::CALL_LINK_CHAT);
+        assert!(
+            worker
+                .archive
+                .chat(crate::model::CALL_LINK_CHAT)
+                .unwrap()
+                .is_none(),
+            "no chat is made for it"
+        );
+        let events: Vec<Event> = events.try_iter().collect();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, Event::CallLog(_)))
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::Messages { .. } | Event::ChatUpdated(_)))
+        );
+    }
+
+    #[test]
+    fn a_group_call_rings_in_its_group_and_nowhere_else() {
+        assert!(rings_in("15551234567@s.whatsapp.net", false));
+        assert!(
+            rings_in("15551234567@s.whatsapp.net", true),
+            "a call with no group"
+        );
+        assert!(rings_in("12345-67890@g.us", true));
+        assert!(
+            !rings_in("12345-67890@g.us", false),
+            "a one-to-one offer never rings as a group's"
+        );
+        assert!(!rings_in("1234567890@broadcast", true));
+        assert!(!rings_in("1234567890@newsletter", true));
+    }
 
     #[test]
     fn only_a_one_to_one_chat_can_be_called() {
