@@ -196,7 +196,9 @@ name or description, in the interface language or in English.
 - **Start at login**: start in the tray without a window, where the platform
   supports it. If the desktop's tray is not up yet, ZapFast waits up to 30
   seconds for it, then opens the window, since a desktop without a tray could
-  not bring it back.
+  not bring it back. On macOS this is a login item under System Settings >
+  General > Login Items, which macOS may ask you to allow there; inside a
+  Flatpak the desktop's background portal asks first.
 - **Check for updates**: ask GitHub once a day whether a newer release exists.
 - **Download updates automatically**: download and verify a new release in the
   background; restarting stays your choice. Package managers and Flatpak update
@@ -287,3 +289,32 @@ the new one.
 Each run replaces `zapfast.log` and records warnings and errors, never
 message contents, phone numbers, or keys. Include the end of this file when
 reporting an issue. **Settings > Files > Log > Open** shows it.
+
+During a call the log also records the call's numbers every few seconds: the
+video rate, loss and keyframes in each direction, and the audio devices'
+health. They are counts and sizes only.
+
+### Saving a call's video for diagnosis
+
+To work on a video call's picture quality, start ZapFast with
+`ZAPFAST_CALL_VIDEO_DUMP` set to a folder. Each video call then writes the
+video it sends and the video it receives there, as raw H.264
+(`<time>-<call>-sent.h264` and `-received.h264`), which `ffmpeg` and media
+players read. Nothing is written without the variable. The files are the
+picture of both people on the call, so only set it for a call whose other side
+agreed, and delete the files when you are done.
+
+### Saving a call's audio for diagnosis
+
+To work on echo cancellation, start ZapFast with `ZAPFAST_CALL_AUDIO_DUMP` set
+to a folder. Each call's microphone stream then writes four files there,
+`<time>-<stream>-reference.wav` (the other side's voice as your speaker played
+it), `-microphone.wav` (your microphone before any processing), `-output.wav`
+(what was sent after echo cancellation, noise suppression and level control),
+all mono 16 kHz, and `-order.csv`, which lets a developer replay the recording
+through the echo canceller exactly as the call ran it
+(`cargo run --release --example aec_replay -- <folder>/<time>-<stream>-reference.wav`,
+with the options listed at the top of `examples/aec_replay.rs`).
+Nothing is written without the variable. The files are both people's voices,
+so only set it for a call whose other side agreed, and delete the files when
+you are done.
