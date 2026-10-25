@@ -293,9 +293,9 @@ fn empty(app: &mut App, ui: &mut egui::Ui) {
         center + vec2(0.0, 30.0),
         Align2::CENTER_CENTER,
         if app.chats.is_empty() {
-            "Your chats appear on the left as they load."
+            crate::i18n::gettext(app.locale, "Your chats appear on the left as they load.")
         } else {
-            "Select a chat on the left."
+            crate::i18n::gettext(app.locale, "Select a chat on the left.")
         },
         theme::regular(14.0),
         palette.secondary,
@@ -618,23 +618,37 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                         18.0,
                         palette.secondary,
                         palette.text,
-                        "More",
+                        &crate::i18n::gettext(app.locale, "More"),
                     );
                     if palette.vibrant() {
                         ui.painter()
                             .set(more_glass, glass_button(&palette, more.rect));
                     }
+                    let info_label = crate::i18n::gettext(app.locale, "Info");
+                    let pin_label = if chat.pinned {
+                        crate::i18n::gettext(app.locale, "Unpin")
+                    } else {
+                        crate::i18n::gettext(app.locale, "Pin to top")
+                    };
+                    let archive_label = if chat.archived {
+                        crate::i18n::gettext(app.locale, "Unarchive")
+                    } else {
+                        crate::i18n::gettext(app.locale, "Archive")
+                    };
+                    let clear_label = crate::i18n::gettext(app.locale, "Clear chat");
+                    let copy_number_label = crate::i18n::gettext(app.locale, "Copy number");
+                    let close_label = crate::i18n::gettext(app.locale, "Close chat");
                     let width = widgets::menu_width(
                         ui,
                         &[
-                            "Info",
+                            info_label.as_ref(),
                             select_messages_label.as_ref(),
-                            "Pin to top",
-                            "Unarchive",
-                            "Clear chat",
+                            pin_label.as_ref(),
+                            archive_label.as_ref(),
+                            clear_label.as_ref(),
                             leave_label.as_ref(),
-                            "Copy number",
-                            "Close chat",
+                            copy_number_label.as_ref(),
+                            close_label.as_ref(),
                         ],
                         true,
                     );
@@ -647,7 +661,12 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                         .width(width)
                         .frame(widgets::menu_frame(&palette))
                         .show(|ui| {
-                            if widgets::menu_item(ui, &palette, Some(Icon::Info), "Info") {
+                            if widgets::menu_item(
+                                ui,
+                                &palette,
+                                Some(Icon::Info),
+                                info_label.as_ref(),
+                            ) {
                                 app.actions.push(Action::OpenInfo(chat.id.clone()));
                             }
                             if widgets::menu_item(
@@ -662,7 +681,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                 ui,
                                 &palette,
                                 Some(if chat.pinned { Icon::PinOff } else { Icon::Pin }),
-                                if chat.pinned { "Unpin" } else { "Pin to top" },
+                                pin_label.as_ref(),
                             ) {
                                 app.actions
                                     .push(Action::SetPinned(chat.id.clone(), !chat.pinned));
@@ -671,11 +690,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                 ui,
                                 &palette,
                                 Some(Icon::Archive),
-                                if chat.archived {
-                                    "Unarchive"
-                                } else {
-                                    "Archive"
-                                },
+                                archive_label.as_ref(),
                             ) {
                                 app.actions
                                     .push(Action::SetArchived(chat.id.clone(), !chat.archived));
@@ -686,7 +701,7 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                 ui,
                                 &palette,
                                 Some(Icon::Eraser),
-                                "Clear chat",
+                                clear_label.as_ref(),
                                 app.is_connected(),
                             ) {
                                 app.actions
@@ -709,11 +724,17 @@ fn header(app: &mut App, ui: &mut egui::Ui, chat: &Chat) -> Rect {
                                     )));
                             }
                             if let Some(phone) = chat.phone()
-                                && widgets::menu_item(ui, &palette, Some(Icon::Copy), "Copy number")
+                                && widgets::menu_item(
+                                    ui,
+                                    &palette,
+                                    Some(Icon::Copy),
+                                    copy_number_label.as_ref(),
+                                )
                             {
                                 app.actions.push(Action::CopyText(format!("+{phone}")));
                             }
-                            if widgets::menu_item(ui, &palette, Some(Icon::X), "Close chat") {
+                            if widgets::menu_item(ui, &palette, Some(Icon::X), close_label.as_ref())
+                            {
                                 app.actions.push(Action::CloseChat);
                             }
                         });
@@ -1466,6 +1487,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                     None => app.reply_to = None,
                 }
             }
+            app.prepare_composer_undo(ui.ctx());
             let id = egui::Id::new("composer-text");
             let has_focus = ui.memory(|memory| memory.has_focus(id));
             let enter_sends = app.settings.enter_sends;
@@ -1529,6 +1551,9 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 .round()
                 .max(COMPOSER_CONTROL);
             let button_width = line;
+            let view_once = app.editing.is_none()
+                && (app.pending_supports_view_once() || app.pending_view_once);
+            let view_once_width = if view_once { COMPOSER_CONTROL + ui.spacing().item_spacing.x } else { 0.0 };
             let field_margin = ((line - line_height) / 2.0).round().max(0.0);
             // Measure this frame's draft at the text column's width, so the
             // field and the panel holding it grow on the keystroke that wraps
@@ -1599,7 +1624,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                 }
                 // The send button closes the row, flush with the field's end.
                 let field_width =
-                    (ui.available_width() - button_width - ui.spacing().item_spacing.x).max(0.0);
+                    (ui.available_width() - button_width - view_once_width - ui.spacing().item_spacing.x).max(0.0);
                 // The ink is centred on the controls, not the line box: the
                 // span from a capital's top to a descender's bottom sits as far
                 // from the field's top as from its bottom. Inter's box leaves
@@ -1801,6 +1826,13 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat) {
                         ui.add_space(bottom);
                         });
                     });
+                if view_once
+                    && last_line(ui, line, |ui| view_once_button(app, ui))
+                        .tab_stop(Stop::ViewOnce)
+                        .clicked()
+                {
+                    app.actions.push(Action::SetPendingViewOnce(!app.pending_view_once));
+                }
                 let ready = !app.composer.trim().is_empty()
                     || !app.pending.is_empty()
                     || (unsent_voice.is_some() && app.editing.is_none());
@@ -4545,6 +4577,7 @@ fn bubble_frame(
                 super::polls::results_button(
                     ui,
                     &palette,
+                    view.locale,
                     message,
                     settled.unwrap_or(cap),
                     actions,
@@ -5643,19 +5676,41 @@ pub(crate) fn menu_width(
     widgets::menu_width(ui, &refs, true).max(quick * 36.0 + 12.0)
 }
 
-/// Every label the message menu can show. The menu is as wide as the longest
-/// one, so Star and Unstar belong here: a long translation is otherwise cut.
+/// Every label the menu of a message other than a call can show, in `locale`.
+/// The menu is as wide as the longest one, and which one that is depends on
+/// the language: a label left out here is cut when its translation is the
+/// longest.
 fn message_menu_labels(locale: crate::i18n::Locale) -> Vec<String> {
-    vec![
-        "Delete for everyone".into(),
-        "Show in folder".into(),
-        "Copy message ID".into(),
-        crate::i18n::gettext(locale, "Open in system player").into_owned(),
-        crate::i18n::gettext(locale, "Message info").into_owned(),
-        crate::i18n::gettext(locale, "Reload earlier messages").into_owned(),
-        crate::i18n::gettext(locale, "Unstar").into_owned(),
-        crate::i18n::gettext(locale, "Star").into_owned(),
+    use crate::i18n::gettext;
+    [
+        gettext(locale, "Reply"),
+        gettext(locale, "Reply privately"),
+        gettext(locale, "Star"),
+        gettext(locale, "Unstar"),
+        gettext(locale, "Pin message"),
+        gettext(locale, "Unpin message"),
+        gettext(locale, "Forward"),
+        gettext(locale, "Open in the viewer"),
+        gettext(locale, "Select"),
+        gettext(locale, "Copy text"),
+        gettext(locale, "Edit"),
+        gettext(locale, "Delete for everyone"),
+        gettext(locale, "Delete for me"),
+        gettext(locale, "Add to favorites"),
+        gettext(locale, "Open in system player"),
+        gettext(locale, "Open file"),
+        gettext(locale, "Copy image"),
+        gettext(locale, "Save as…"),
+        gettext(locale, "Show in folder"),
+        gettext(locale, "Downloading…"),
+        gettext(locale, "Download"),
+        gettext(locale, "Message info"),
+        gettext(locale, "Reload earlier messages"),
+        gettext(locale, "Copy message ID"),
     ]
+    .into_iter()
+    .map(|label| label.into_owned())
+    .collect()
 }
 
 /// Where a message menu was opened from. A starred row has no composer, no
@@ -5804,6 +5859,7 @@ fn selection_menu(
     selection_delete_items(
         ui,
         &view.palette,
+        view.locale,
         &view.chat.id,
         selection_can_revoke(messages, selected, view.now),
         selected,
@@ -5816,16 +5872,25 @@ fn selection_menu(
 fn selection_delete_items(
     ui: &mut egui::Ui,
     palette: &Palette,
+    locale: crate::i18n::Locale,
     chat: &str,
     can_revoke: bool,
     selected: &[String],
     actions: &mut Vec<Action>,
 ) {
     for (label, for_everyone, enabled) in [
-        ("Delete for everyone", true, can_revoke),
-        ("Delete for me", false, !selected.is_empty()),
+        (
+            crate::i18n::gettext(locale, "Delete for everyone"),
+            true,
+            can_revoke,
+        ),
+        (
+            crate::i18n::gettext(locale, "Delete for me"),
+            false,
+            !selected.is_empty(),
+        ),
     ] {
-        if widgets::menu_item_enabled(ui, palette, Some(Icon::Trash), label, enabled) {
+        if widgets::menu_item_enabled(ui, palette, Some(Icon::Trash), &label, enabled) {
             actions.push(Action::ShowDialog(Dialog::ConfirmDeleteSelection {
                 chat: chat.to_owned(),
                 messages: selected.to_vec(),
@@ -5875,7 +5940,9 @@ fn context_menu(
                 line.paint(ui, rect.center() - line.size() / 2.0, palette.text);
                 let response = response.on_hover_cursor(egui::CursorIcon::PointingHand);
                 let response = if chosen {
-                    response.on_hover_text("Remove your reaction")
+                    response.on_hover_text(
+                        crate::i18n::gettext(view.locale, "Remove your reaction").into_owned(),
+                    )
                 } else {
                     response
                 };
@@ -5908,7 +5975,9 @@ fn context_menu(
             }
             if response
                 .on_hover_cursor(egui::CursorIcon::PointingHand)
-                .on_hover_text("React with any emoji")
+                .on_hover_text(
+                    crate::i18n::gettext(view.locale, "React with any emoji").into_owned(),
+                )
                 .clicked()
             {
                 actions.push(Action::OpenReactionPicker {
@@ -5921,7 +5990,12 @@ fn context_menu(
     );
     widgets::menu_separator(ui, &palette);
     if !matches!(message.content, Content::Revoked)
-        && widgets::menu_item(ui, &palette, Some(Icon::Reply), "Reply")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Reply),
+            &crate::i18n::gettext(view.locale, "Reply"),
+        )
     {
         if matches!(origin, MenuOrigin::List) {
             actions.push(Action::OpenMessage {
@@ -5979,7 +6053,12 @@ fn context_menu(
         });
     }
     if crate::app::can_select(&message.content)
-        && widgets::menu_item(ui, &palette, Some(Icon::Forward), "Forward")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Forward),
+            &crate::i18n::gettext(view.locale, "Forward"),
+        )
     {
         actions.push(Action::ShowDialog(Dialog::Forward {
             chat: chat.clone(),
@@ -6005,7 +6084,12 @@ fn context_menu(
         });
     }
     if crate::app::can_select(&message.content)
-        && widgets::menu_item(ui, &palette, Some(Icon::Check), "Select")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Check),
+            &crate::i18n::gettext(view.locale, "Select"),
+        )
     {
         if matches!(origin, MenuOrigin::List) {
             actions.push(Action::OpenMessage {
@@ -6034,7 +6118,12 @@ fn context_menu(
         _ => None,
     };
     if let Some(text) = text
-        && widgets::menu_item(ui, &palette, Some(Icon::Copy), "Copy text")
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Copy),
+            &crate::i18n::gettext(view.locale, "Copy text"),
+        )
     {
         let mentions = mentions_of(view, message);
         actions.push(Action::CopyText(markup::plain(&text, &mentions)));
@@ -6046,7 +6135,14 @@ fn context_menu(
     let can_revoke = message.from_me
         && !matches!(message.content, Content::Revoked)
         && age <= crate::app::REVOKE_WINDOW.as_secs() as i64;
-    if can_edit && widgets::menu_item(ui, &palette, Some(Icon::Pencil), "Edit") {
+    if can_edit
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Pencil),
+            &crate::i18n::gettext(view.locale, "Edit"),
+        )
+    {
         if matches!(origin, MenuOrigin::List) {
             actions.push(Action::OpenMessage {
                 chat: chat.clone(),
@@ -6055,14 +6151,26 @@ fn context_menu(
         }
         actions.push(Action::Edit(message.id.clone()));
     }
-    if can_revoke && widgets::menu_item(ui, &palette, Some(Icon::Trash), "Delete for everyone") {
+    if can_revoke
+        && widgets::menu_item(
+            ui,
+            &palette,
+            Some(Icon::Trash),
+            &crate::i18n::gettext(view.locale, "Delete for everyone"),
+        )
+    {
         actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
             chat: view.chat.id.clone(),
             message: message.id.clone(),
             for_everyone: true,
         }));
     }
-    if widgets::menu_item(ui, &palette, Some(Icon::EyeOff), "Delete for me") {
+    if widgets::menu_item(
+        ui,
+        &palette,
+        Some(Icon::EyeOff),
+        &crate::i18n::gettext(view.locale, "Delete for me"),
+    ) {
         actions.push(Action::ShowDialog(Dialog::ConfirmDeleteMessage {
             chat: view.chat.id.clone(),
             message: message.id.clone(),
@@ -6086,7 +6194,7 @@ fn context_menu(
                 let open = if matches!(message.content, Content::Video { gif: false, .. }) {
                     crate::i18n::gettext(view.locale, "Open in system player")
                 } else {
-                    "Open file".into()
+                    crate::i18n::gettext(view.locale, "Open file")
                 };
                 if widgets::menu_item(ui, &palette, Some(Icon::ExternalLink), &open) {
                     actions.push(Action::OpenFile(path.clone()));
@@ -6101,14 +6209,24 @@ fn context_menu(
                 {
                     actions.push(Action::CopyImage(path.clone()));
                 }
-                if widgets::menu_item(ui, &palette, Some(Icon::Download), "Save as…") {
+                if widgets::menu_item(
+                    ui,
+                    &palette,
+                    Some(Icon::Download),
+                    &crate::i18n::gettext(view.locale, "Save as…"),
+                ) {
                     actions.push(Action::SaveAttachmentAs {
                         path: path.clone(),
                         name: attachment_name(&message.content, path),
                     });
                 }
                 if let Some(folder) = path.parent()
-                    && widgets::menu_item(ui, &palette, Some(Icon::FileText), "Show in folder")
+                    && widgets::menu_item(
+                        ui,
+                        &palette,
+                        Some(Icon::FileText),
+                        &crate::i18n::gettext(view.locale, "Show in folder"),
+                    )
                 {
                     actions.push(Action::OpenFolder(folder.to_path_buf()));
                 }
@@ -6119,10 +6237,10 @@ fn context_menu(
                     ui,
                     &palette,
                     Some(Icon::Download),
-                    if downloading {
-                        "Downloading…"
+                    &if downloading {
+                        crate::i18n::gettext(view.locale, "Downloading…")
                     } else {
-                        "Download"
+                        crate::i18n::gettext(view.locale, "Download")
                     },
                     !downloading,
                 ) {
@@ -6170,7 +6288,12 @@ fn context_menu(
         });
     }
     // The id helps when looking a message up for a bug report.
-    if widgets::menu_item(ui, &palette, Some(Icon::Copy), "Copy message ID") {
+    if widgets::menu_item(
+        ui,
+        &palette,
+        Some(Icon::Copy),
+        &crate::i18n::gettext(view.locale, "Copy message ID"),
+    ) {
         actions.push(Action::CopyText(message.id.clone()));
     }
 }
@@ -6750,6 +6873,7 @@ fn content(
             super::polls::ballot(
                 ui,
                 &palette,
+                view.locale,
                 message,
                 width,
                 view.connected,
@@ -9677,6 +9801,7 @@ fn select_box(ui: &egui::Ui, palette: &Palette, rect: Rect, checked: bool) {
 /// Replaces the composer while messages are selected.
 fn selection_bar(app: &mut App, ui: &mut egui::Ui, chat: &str, selected: &[String]) {
     let palette = app.palette;
+    let locale = app.locale;
     ui.horizontal(|ui| {
         if theme::icon_button(
             ui,
@@ -9684,25 +9809,32 @@ fn selection_bar(app: &mut App, ui: &mut egui::Ui, chat: &str, selected: &[Strin
             18.0,
             palette.secondary,
             palette.text,
-            "Cancel selection",
+            &crate::i18n::gettext(locale, "Cancel selection"),
         )
         .clicked()
             || ui.input(|input| input.key_pressed(Key::Escape))
         {
             app.actions.push(Action::CancelSelection);
         }
-        let count = if selected.len() == 1 {
-            "1 selected".to_owned()
-        } else {
-            format!("{} selected", selected.len())
-        };
+        let count = crate::i18n::ngettext(
+            locale,
+            "{count} selected",
+            "{count} selected",
+            selected.len() as u32,
+        )
+        .replace("{count}", &selected.len().to_string());
         theme::text(ui, &count, theme::medium(14.5), palette.text);
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             // The selection stays open with nothing in it, as its check
             // boxes do; there is nothing to forward until one is ticked.
             let forward = ui
                 .add_enabled_ui(!selected.is_empty(), |ui| {
-                    theme::pill_button(ui, &palette, "Forward…", true)
+                    theme::pill_button(
+                        ui,
+                        &palette,
+                        &crate::i18n::gettext(locale, "Forward…"),
+                        true,
+                    )
                 })
                 .inner;
             if forward.clicked() {
@@ -9713,7 +9845,12 @@ fn selection_bar(app: &mut App, ui: &mut egui::Ui, chat: &str, selected: &[Strin
             }
             let delete = ui
                 .add_enabled_ui(!selected.is_empty(), |ui| {
-                    theme::pill_button(ui, &palette, "Delete…", false)
+                    theme::pill_button(
+                        ui,
+                        &palette,
+                        &crate::i18n::gettext(locale, "Delete…"),
+                        false,
+                    )
                 })
                 .inner;
             // Demo/test: hold this menu open for a screenshot.
@@ -9724,13 +9861,25 @@ fn selection_bar(app: &mut App, ui: &mut egui::Ui, chat: &str, selected: &[Strin
             let can_revoke = app.conversations.get(chat).is_some_and(|conversation| {
                 selection_can_revoke(&conversation.messages, selected, crate::util::now())
             });
-            let width = widgets::menu_width(ui, &["Delete for everyone", "Delete for me"], true);
+            let labels = [
+                crate::i18n::gettext(app.locale, "Delete for everyone"),
+                crate::i18n::gettext(app.locale, "Delete for me"),
+            ];
+            let width = widgets::menu_width(ui, &[&*labels[0], &*labels[1]], true);
             let mut actions = Vec::new();
             egui::Popup::menu(&delete)
                 .width(width)
                 .frame(widgets::menu_frame(&palette))
                 .show(|ui| {
-                    selection_delete_items(ui, &palette, chat, can_revoke, selected, &mut actions);
+                    selection_delete_items(
+                        ui,
+                        &palette,
+                        app.locale,
+                        chat,
+                        can_revoke,
+                        selected,
+                        &mut actions,
+                    );
                 });
             app.actions.extend(actions);
         });
@@ -11093,6 +11242,217 @@ mod reaction_tests {
         assert_eq!(quick_reactions(&message, &[]), QUICK_REACTIONS.to_vec());
     }
 
+    /// A message as a list row draws its menu: starred or not, pinned or not.
+    struct MenuRow {
+        message: Message,
+        marks: Marks,
+        pinned: bool,
+    }
+
+    /// The accessible labels of the message menu for `row`, drawn in
+    /// `locale` the way a right-click draws it.
+    fn drawn_menu_labels(locale: crate::i18n::Locale, row: &MenuRow) -> Vec<String> {
+        let message = &row.message;
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, _) = App::headless(
+            crate::paths::AppDirs::under(directory.path()),
+            crate::settings::Settings::default(),
+        );
+        app.locale = locale;
+        if row.pinned {
+            app.pins
+                .insert(message.chat.clone(), HashSet::from([message.id.clone()]));
+        }
+        let chat = Chat::new(message.chat.clone(), "Ada".into());
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::install(&ctx);
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            list_menu(&app, ui, &chat, message, row.marks, &mut actions);
+        });
+        output.textures_delta.clear();
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        tree.nodes
+            .iter()
+            .filter_map(|(_, node)| node.label().map(str::to_owned))
+            .collect()
+    }
+
+    /// The labels of the message menu made of words: quick reactions are emoji.
+    fn drawn_menu_words(locale: crate::i18n::Locale, row: &MenuRow) -> Vec<String> {
+        drawn_menu_labels(locale, row)
+            .into_iter()
+            .filter(|label| label.chars().any(|c| c.is_alphabetic()))
+            .collect()
+    }
+
+    /// Rows whose menus between them show every entry a list row can: our
+    /// own fresh delivered text, starred and pinned, photos with and without
+    /// their file and one downloading, a video and a sticker.
+    fn menu_fixtures(file: &Path) -> Vec<MenuRow> {
+        use MediaState::{Downloading, Idle};
+        let mut own = with_reactions(Vec::new());
+        own.from_me = true;
+        own.timestamp = crate::util::now();
+        own.status = Delivery::Delivered;
+        let path = Some(file.to_path_buf());
+        let media = |mime: &str, path: Option<PathBuf>, state| Media {
+            mime: mime.into(),
+            size: 1,
+            width: None,
+            height: None,
+            album: None,
+            path,
+            state,
+        };
+        let row = |content: Content| {
+            let mut message = with_reactions(Vec::new());
+            message.content = content;
+            MenuRow {
+                message,
+                marks: Marks { starred: false },
+                pinned: false,
+            }
+        };
+        let photo = |path: Option<PathBuf>, state| {
+            row(Content::Image {
+                caption: None,
+                media: media("image/jpeg", path, state),
+                motion: None,
+            })
+        };
+        vec![
+            MenuRow {
+                message: own,
+                marks: Marks { starred: true },
+                pinned: true,
+            },
+            photo(path.clone(), Idle),
+            photo(None, Idle),
+            photo(None, Downloading),
+            row(Content::Video {
+                caption: None,
+                media: media("video/mp4", path.clone(), Idle),
+                seconds: None,
+                gif: false,
+                note: false,
+            }),
+            row(Content::Sticker {
+                media: media("image/webp", path, Idle),
+                animated: false,
+            }),
+        ]
+    }
+
+    #[test]
+    fn the_message_menu_speaks_the_interface_language() {
+        // #552: the menu came out in English whatever the language.
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("photo.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+        let mut labels = Vec::new();
+        for row in menu_fixtures(&file) {
+            let spanish = drawn_menu_words(crate::i18n::Locale::Spanish, &row);
+            for english in drawn_menu_words(crate::i18n::Locale::English, &row) {
+                assert!(!spanish.contains(&english), "{english} in {spanish:?}");
+            }
+            labels.extend(spanish);
+        }
+        for spanish in [
+            "Responder",
+            "Copiar texto",
+            "Eliminar para mí",
+            "Abrir archivo",
+            "Mostrar en la carpeta",
+            "Descargar",
+        ] {
+            assert!(
+                labels.iter().any(|label| label == spanish),
+                "{spanish} in {labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_message_menu_label_can_be_translated() {
+        const TEMPLATE: &str = include_str!("../../assets/i18n/zapfast.pot");
+        // Line by line: a Windows checkout may end the template's lines in CRLF.
+        let translatable = |text: &str| {
+            let msgid = format!("msgid \"{text}\"");
+            TEMPLATE.lines().any(|line| line == msgid)
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let file = directory.path().join("photo.jpg");
+        std::fs::write(&file, b"jpeg").unwrap();
+        let mut labels: Vec<String> = menu_fixtures(&file)
+            .iter()
+            .flat_map(|row| drawn_menu_words(crate::i18n::Locale::English, row))
+            .collect();
+        // The menu is as wide as the longest label it measures.
+        let measured = message_menu_labels(crate::i18n::Locale::English);
+        for label in &labels {
+            assert!(measured.contains(label), "menu width leaves out {label}");
+        }
+        // The fixtures reach every entry a list row's menu can show. A private
+        // reply starts from the group on screen, so only the chat offers it.
+        let undrawn: Vec<&str> = measured
+            .iter()
+            .map(String::as_str)
+            .filter(|label| !labels.iter().any(|drawn| drawn == label))
+            .collect();
+        assert_eq!(undrawn, ["Reply privately"]);
+        // Hover texts are not in the accessibility tree.
+        labels.extend(["React with any emoji".into(), "Remove your reaction".into()]);
+        labels.sort();
+        labels.dedup();
+        let untranslatable: Vec<_> = labels.iter().filter(|label| !translatable(label)).collect();
+        assert!(
+            untranslatable.is_empty(),
+            "not translatable: {untranslatable:?}"
+        );
+        for label in message_menu_labels(crate::i18n::Locale::English) {
+            assert!(
+                translatable(&label),
+                "menu width uses untranslatable {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_selection_delete_menu_speaks_the_interface_language() {
+        let ctx = egui::Context::default();
+        ctx.enable_accesskit();
+        crate::theme::install(&ctx);
+        let mut actions = Vec::new();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            selection_delete_items(
+                ui,
+                &crate::theme::Palette::dark(),
+                crate::i18n::Locale::Spanish,
+                "chat",
+                true,
+                &["message".to_owned()],
+                &mut actions,
+            );
+        });
+        output.textures_delta.clear();
+        let tree = output
+            .platform_output
+            .accesskit_update
+            .expect("accessibility tree");
+        let labels: Vec<_> = tree
+            .nodes
+            .iter()
+            .filter_map(|(_, node)| node.label())
+            .collect();
+        assert!(labels.contains(&"Eliminar para todos"), "{labels:?}");
+        assert!(labels.contains(&"Eliminar para mí"), "{labels:?}");
+    }
+
     #[test]
     fn the_message_menu_measures_star_and_unstar() {
         let labels = message_menu_labels(crate::i18n::Locale::German);
@@ -11264,4 +11624,51 @@ fn pending_strip(app: &mut App, ui: &mut egui::Ui) {
         app.actions.push(Action::EditPicture(target));
     }
     ui.add_space(4.0);
+}
+
+/// A photo's view-once choice stays beside its caption and Send, with the
+/// same dashed-circle mark as on the phone. Its state is exposed to readers
+/// and keyboard users as a checkbox, even though it is drawn as an icon.
+fn view_once_button(app: &App, ui: &mut egui::Ui) -> egui::Response {
+    let palette = app.palette;
+    let selected = app.pending_view_once;
+    let (rect, response) = ui.allocate_exact_size(Vec2::splat(COMPOSER_CONTROL), Sense::click());
+    theme::reveal_focus(&response);
+    theme::focus_outline(ui, response.id, rect, COMPOSER_CONTROL / 2.0);
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(
+            egui::WidgetType::Checkbox,
+            ui.is_enabled(),
+            selected,
+            crate::i18n::gettext(app.locale, "View once"),
+        )
+    });
+    if ui.is_rect_visible(rect) {
+        let hovered = response.hovered() || response.has_focus();
+        let fill = if selected {
+            if hovered {
+                palette.accent_hover
+            } else {
+                palette.accent
+            }
+        } else if hovered {
+            palette.surface_hover
+        } else {
+            Color32::TRANSPARENT
+        };
+        ui.painter()
+            .circle_filled(rect.center(), COMPOSER_CONTROL / 2.0, fill);
+        let color = if selected {
+            palette.on_accent
+        } else {
+            palette.secondary
+        };
+        theme::paint_icon(ui, Icon::ViewOnce, rect, 24.0, color);
+    }
+    response
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(crate::i18n::gettext(
+            app.locale,
+            "The recipient can open this photo only once, on their phone.",
+        ))
 }

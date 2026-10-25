@@ -21,6 +21,7 @@ On Linux:
 | Wallpaper image | `~/.local/state/zapfast/accounts/<id>/wallpaper.jpg` | Copy of the chosen picture (or `.png`, `.webp`, `.gif`) |
 | Attachments, avatars | `~/.cache/zapfast/accounts/<id>/` | Safe to delete; available files download again when viewed |
 | Last run's log | `~/.local/state/zapfast/zapfast.log` | `--verbose` for more |
+| The run before's log | `~/.local/state/zapfast/zapfast.previous.log` | Kept for one more start |
 | Crash log | `~/.local/state/zapfast/panic.log` | Safe to delete |
 
 Back up the archive if you need its history. WhatsApp sends only recent
@@ -146,9 +147,11 @@ name or description, in the interface language or in English.
   does not answer goes to the back of the queue. Pages fetched this way go into
   the archive without moving the view. A chat the phone says has nothing older
   is not asked again.
-- **Keep chats archived** (development builds): on by default. When off, a new
-  message, received or sent, brings an archived chat back to the list. Applies
-  to all accounts here; it does not read or change the phone's own setting.
+- **Keep chats archived**: on by default. When off, a new message, received or
+  sent, brings an archived chat back to the list. Applies to all accounts here
+  whose phone has not sent its own **Keep chats archived**; once a phone has,
+  ZapFast follows the phone for that account. It does not change the phone's
+  setting.
 - **Pause other media while recording or playing**: pause music and videos in
   other apps while you record, or while a voice message, audio, or video plays
   with sound, and resume them afterwards. Linux and Windows only.
@@ -286,9 +289,11 @@ the new one.
 
 ## The log
 
-Each run replaces `zapfast.log` and records warnings and errors, never
+Each run starts `zapfast.log` afresh and records warnings and errors, never
 message contents, phone numbers, or keys. Include the end of this file when
-reporting an issue. **Settings > Files > Log > Open** shows it.
+reporting an issue. **Settings > Files > Log > Open** shows it. The run before
+is kept beside it as `zapfast.previous.log`: if ZapFast froze and you had to
+restart it, that file holds what happened.
 
 During a call the log also records the call's numbers every few seconds: the
 video rate, loss and keyframes in each direction, and the audio devices'

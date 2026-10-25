@@ -74,8 +74,8 @@ protocol. These notes are for coding agents and new contributors.
   Views draw the active account through `App`'s `Deref` to `Account`.
   A navigation rail (`src/ui/rail.rs`) runs down the left of the chat list
   on every platform, 52 points wide and a shade darker than the list:
-  Chats, Calls and Starred at the top, the one on screen lit (Calls and
-  Starred are left through Chats or Escape, never toggled); Archived and
+  Chats and Calls at the top, the one on screen lit (Calls and Starred
+  are left through Chats or Escape, never toggled); Starred, Archived and
   Locked (while there are such chats; they open in the list column),
   Settings and our own avatar at the bottom. While the list is hidden the
   chats' avatars fill it between the two (`chats::compact_list`); beside the
@@ -203,9 +203,12 @@ protocol. These notes are for coding agents and new contributors.
   call per account; the window (`app/calls.rs`) holds one call across all
   accounts with its `AccountId`, routes call actions to that account's
   backend, and declines another account's offer while one is up.
-  Group calls are not available yet: `calls::GROUP_CALLS_ENABLED` is
-  `false` (a real test carried no media either way), and everything below
-  about them is the code behind that switch, kept compiling and tested
+  Group calls are experimental: `calls::GROUP_CALLS_ENABLED` is `true` since
+  0.20. A three-person test carried audio every way and video both ways, but
+  our video froze every few seconds, since the library sends video FEC in
+  1:1 calls only (a guessed hop-by-hop group FEC, whatsapp-rust branch
+  `voip-group-video-fec`, made the SFU drop our media altogether). The switch
+  stays, kept compiling and tested both ways
   (`calls::override_group_calls` sets it per test thread). Read it through
   `calls::group_calls_enabled()`. While it is off a group has no call
   button and no call back (`ui::conversation::callable`, `call_menu`, the
@@ -273,10 +276,22 @@ protocol. These notes are for coding agents and new contributors.
   at most, 25 fps) into the library's timed `VideoSource`. `src/video_rate.rs`
   adapts the bitrate (from 700 kbit/s) and the step of size and frame rate
   (480p, 540p and 720p, all at 25 fps, preferring motion to size) to the peer's RTCP loss, its REMB, dropped video,
-  and queue delay (the round trip from its reports' LSR/DLSR above the call's
-  shortest, since a deep buffer holds seconds before it loses), and climbs
+  queue delay (the round trip from its reports' LSR/DLSR above the call's
+  shortest, since a deep buffer holds seconds before it loses), and the rate
+  the peer receives (word 5 of WhatsApp's 24-byte extension to its video
+  report block; below 75% of what the encoder made over the last few seconds,
+  never the rate, which a calm picture stays well under, it caps us at 90% of it, once word 0, the
+  bytes received, passes 500 kB, since it starts from nothing), and climbs
   quickly back only to just under where loss was last reported, slowly past it;
-  keyframes go out every five seconds unasked, and on the peer's request. The
+  loss from 2% to 10%, and each keyframe request, hold it from rising for
+  `CONGESTION_HOLD` without cutting it (an iPhone asks once near the start of
+  a clean call too);
+  keyframes go out every five seconds unasked, and on the peer's request. In a
+  1:1 call the library sends XOR repair packets (FEC) beside the video, which an
+  iPhone relies on since it never NACKs; the rate chosen is the total on the
+  wire, so each heartbeat measures FEC's bytes against the video sent
+  (`RateControl::on_fec_sent`, `MediaStats::video_fec_bytes_sent`) and the
+  encoder's target leaves room for them. The
   call's heartbeat logs both directions' frame counts, keyframes and decode
   failures, and the peer's H.264 profile (`src/call_diag.rs`);
   `ZAPFAST_CALL_VIDEO_DUMP=<folder>` writes both directions' access units as
@@ -432,6 +447,29 @@ protocol. These notes are for coding agents and new contributors.
   people picked but missing are reported by name. `group_created` files the
   chat named, with its members and our admin rights, before
   `Event::GroupCreated` opens it.
+- Group management lives in the info panel (`src/group_admin.rs`, the worker's
+  `backend/worker/group_admin.rs`). The metadata's permissions and admins are
+  filed as `chats.group_settings` (JSON, NULL until known; `Chat::group_settings`),
+  read by `settings_of`: only an explicit `all_member_add`/`all_member_link`
+  lets members add people or see the link, WhatsApp's default being admins
+  only. `Chat::can_add_members`, `can_share_invite_link` and `can_manage_group`
+  gate the panel's Add members, Invite via link, Group permissions (an
+  `InfoView::Permissions` page: `set_locked`, `set_announce`,
+  `set_member_add_mode`, `set_membership_approval`) and each member's menu
+  (`promote_participants`, `demote_participants`, `remove_participants`);
+  the worker checks the same rights again. Add members is New group's
+  `Draft` made with `Draft::adding` (the choosing step alone, without the
+  group's members), sent with `add_participants`, whose per-person error
+  codes name who was refused and why (403 privacy, 408 recently left; 409,
+  already in, counts as added). Each answer returns as
+  `Command::GroupManaged`; `group_managed` files only what WhatsApp accepted
+  and bumps `settings_generation`, so metadata asked for earlier (the library
+  joins a query in flight) cannot undo it, and a refusal re-asks the
+  metadata. The invite link (`groups().get_invite_link`, `reset` revokes it)
+  is a secret: `group_admin::InviteLink` hides it from `Debug`, it is never
+  logged or stored, and the window keeps it only while the panel shows its
+  group (`App::info_invite`). The library has no simple way to send an
+  invite message, so people WhatsApp refuses are named and pointed to the link.
 - Mentioning everyone uses the visible body token `@all` and bit 1 of
   `ContextInfo.non_jid_mentions` (`src/mentions.rs`). Localized words
   (`@todos` in Portuguese, and the one-word alias of each other language)

@@ -704,8 +704,9 @@ pub struct VideoPipeline {
     /// What the peer's RTCP feedback has asked of our video, for the heartbeat's log line.
     feedback: crate::video_rate::PeerFeedback,
     /// The WhatsApp extension of the peer's latest report on our video: 24 bytes of transport
-    /// statistics after the standard report block, whose fields are not decoded yet. Logged so a
-    /// call's numbers can be set beside what we know we sent.
+    /// statistics after the standard report block, of which only the bytes and the rate received
+    /// are decoded ([`crate::video_rate::peer_receiving`]). Logged whole so a call's numbers can be
+    /// set beside what we know we sent.
     report_extension: Vec<u8>,
     /// The peer's latest interarrival jitter for our video, in the 90 kHz clock, for the log.
     peer_jitter: Option<u32>,
@@ -788,6 +789,14 @@ impl VideoPipeline {
         )
     }
 
+    /// What the peer says it receives of our video, from its report's extension.
+    fn on_peer_receiving(
+        &mut self,
+        receiving: crate::video_rate::PeerReceiving,
+    ) -> Option<RateChange> {
+        self.rate.on_peer_receiving(receiving, Instant::now())
+    }
+
     /// The relay connection could not take all the video queued for it.
     fn on_send_drops(&mut self) -> Option<RateChange> {
         self.rate.on_send_drops(Instant::now())
@@ -796,6 +805,12 @@ impl VideoPipeline {
     /// The camera thread could not hand all its frames to the engine.
     fn on_capture_drops(&mut self) -> Option<RateChange> {
         self.rate.on_capture_drops(Instant::now())
+    }
+
+    /// The FEC bytes the engine has sent so far in the call, which the encoder's share of the rate
+    /// is measured against.
+    fn on_fec_sent(&mut self, fec_bytes_total: u64) {
+        self.rate.on_fec_sent(fec_bytes_total);
     }
 
     fn source(&self) -> LocalVideoSource {
@@ -1128,7 +1143,8 @@ fn capture_frames(
             }
         }
         plan.setting.bitrate = wanted.bitrate;
-        encoder.set_bitrate(wanted.bitrate);
+        // The rate chosen is what goes on the wire, and the engine's FEC takes its share of it.
+        encoder.set_bitrate(controls.rate.encoder_bitrate(wanted));
 
         let send = countdown == 0;
         let read = if send {
@@ -1198,9 +1214,15 @@ fn capture_frames(
                 Ok(unit) => {
                     controls.diag.counters.sent(&unit);
                     controls.diag.sent.write(&unit);
+                    let len = unit.len();
+                    // The library's clock shares no origin with ours, so the capture goes over
+                    // by its age: the peer reads the time from capture to departure from it.
+                    let captured_at =
+                        whatsapp_rust::wacore::time::Instant::now() - captured.elapsed();
                     let frame = TimedVideoFrame::builder()
                         .data(unit)
                         .timestamp(clock.stamp(captured))
+                        .captured_at(captured_at)
                         .build();
                     // A full queue means the wire is behind. The frame is dropped, which leaves the
                     // peer's decoder without its reference, so the next frame sent starts afresh,
@@ -1208,8 +1230,11 @@ fn capture_frames(
                     if timed.try_send(frame).is_err() {
                         resync = true;
                         controls.rate.note_queue_drop();
-                    } else if keyframe {
-                        resync = false;
+                    } else {
+                        controls.rate.note_sent(len);
+                        if keyframe {
+                            resync = false;
+                        }
                     }
                 }
                 Err(error) => log::warn!("[CALL] camera frame could not be encoded: {error}"),
@@ -1414,6 +1439,9 @@ fn log_rate_change(call_id: &str, change: RateChange) {
         Reason::SendDrops => "video was dropped before it was sent".to_owned(),
         Reason::CaptureDrops => "camera frames backed up before the engine".to_owned(),
         Reason::Estimate(bitrate) => format!("the peer can take {} kbps", bitrate / 1000),
+        Reason::Receiving(bitrate) => {
+            format!("the peer receives only {} kbps", bitrate / 1000)
+        }
         Reason::Delay(queued) => format!(
             "the round trip stood {} ms above its shortest",
             queued.as_millis()
@@ -1479,14 +1507,13 @@ impl std::error::Error for Cancelled {}
 /// Whether ZapFast takes part in group calls: starts them from a group's header or the Calls
 /// page, rings for them, answers them, and joins call links.
 ///
-/// Off for now: in a real test neither direction carried any media (an outgoing call was accepted
-/// by WhatsApp but rang nobody; an answered incoming one received no RTP and the peer saw it
-/// reconnecting). While it is off, a group has no call button, a call link is not joined, and an
-/// incoming group call does not take the screen: the window only says who is calling and to
-/// answer on the phone, and sends WhatsApp nothing, so the phone keeps ringing. The group call
-/// code and its tests stay in place; turning this back on is the one change that brings them back.
+/// On since 0.20, as an experiment: a three-person test carried audio every way and video both
+/// ways, though our video froze every few seconds without video FEC in group calls. Turned off, a
+/// group has no call button, a call link is not joined, and an incoming group call does not take
+/// the screen: the window only says who is calling and to answer on the phone, and sends WhatsApp
+/// nothing, so the phone keeps ringing. Both ways stay compiled and tested.
 /// Read it through [`group_calls_enabled`], which tests can override on their own thread.
-pub const GROUP_CALLS_ENABLED: bool = false;
+pub const GROUP_CALLS_ENABLED: bool = true;
 
 #[cfg(test)]
 thread_local! {
@@ -2841,6 +2868,10 @@ impl Call {
                 let pipe = self.video_pipe.as_mut()?;
                 for item in feedback {
                     pipe.feedback.note(item.packet_type, item.fmt, &item.fci);
+                    // A PLI or a FIR: a picture the peer could not rebuild.
+                    if item.packet_type == 206 && matches!(item.fmt, 1 | 4) {
+                        pipe.rate.on_picture_lost(Instant::now());
+                    }
                 }
                 // The peer's native video report covers our video stream alone.
                 if *reports_video
@@ -2888,6 +2919,17 @@ impl Call {
                 {
                     log_rate_change(&self.call_id, change);
                 }
+                // After the estimates, so that a path falling short is capped at what it carries
+                // even when the same packet's REMB says more.
+                if *reports_video
+                    && !*reports_audio
+                    && let Some(block) = report_blocks.first()
+                    && let Some(receiving) =
+                        crate::video_rate::peer_receiving(&block.profile_extension)
+                    && let Some(change) = pipe.on_peer_receiving(receiving)
+                {
+                    log_rate_change(&self.call_id, change);
+                }
                 None
             }
             // The relay connection could not take all the video queued for it.
@@ -2919,6 +2961,19 @@ impl Call {
             && let Some(change) = pipe.on_capture_drops()
         {
             log_rate_change(&self.call_id, change);
+        }
+    }
+
+    /// Takes the share of our video's wire the engine's FEC used since the last heartbeat out of
+    /// the encoder's target, so video and FEC together stay at the rate the rate control chose.
+    /// Called from the call heartbeat.
+    pub fn budget_video_fec(&mut self) {
+        let Some(handle) = self.handle.as_ref() else {
+            return;
+        };
+        let fec_bytes = handle.media_stats().video_fec_bytes_sent;
+        if let Some(pipe) = self.video_pipe.as_mut() {
+            pipe.on_fec_sent(fec_bytes);
         }
     }
 
@@ -2962,7 +3017,8 @@ impl Call {
                  peer_nacked_packets={} peer_plis={} peer_firs={} peer_estimates={} \
                  peer_estimate_kbps={} rtt_ms={} rtt_floor_ms={} peer_jitter_ms={} \
                  peer_report_extension={} encoded_frames={} keyframes={} largest_keyframe_kb={} \
-                 peer_frames_decoded={} peer_frames_undecodable={}",
+                 peer_frames_decoded={} peer_frames_undecodable={} encoder_kbps={} \
+                 fec_packets_total={} fec_kb_total={}",
                 self.call_id,
                 marker,
                 rate.bitrate / 1000,
@@ -2985,6 +3041,9 @@ impl Call {
                 counts.largest_keyframe / 1024,
                 counts.decoded,
                 counts.undecodable,
+                pipe.rate_share.encoder_bitrate(rate) / 1000,
+                stats.video_fec_sent,
+                stats.video_fec_bytes_sent / 1024,
             );
         }
         self.log_audio_path(marker);
@@ -4482,6 +4541,56 @@ mod tests {
             }
         );
         assert_eq!(pipe.report_extension, vec![0xab; 24]);
+    }
+
+    /// A report on our video alone whose extension says the peer receives far less than we send
+    /// caps the rate; the same extension on a report that covers audio as well does not.
+    #[test]
+    fn what_the_peer_receives_of_our_video_caps_the_rate() {
+        use whatsapp_rust::voip_control::MediaRtcpReportBlock;
+        let mut extension = vec![0; 24];
+        extension[..4].copy_from_slice(&2_000_000u32.to_be_bytes());
+        extension[20..].copy_from_slice(&400_000u32.to_be_bytes());
+        let report = |reports_audio: bool| CallEvent::RtcpReceived {
+            packet_types: vec![201],
+            sender_ssrc: 1,
+            referenced_ssrcs: vec![9],
+            reports_audio,
+            reports_video: true,
+            report_blocks: vec![
+                MediaRtcpReportBlock::builder()
+                    .ssrc(9)
+                    .fraction_lost(0)
+                    .cumulative_lost(0)
+                    .extended_highest_sequence(0)
+                    .jitter(0)
+                    .last_sender_report(0)
+                    .delay_since_last_sender_report(0)
+                    .profile_extension(extension.clone())
+                    .build(),
+            ],
+            feedback: Vec::new(),
+        };
+        let mut call = dialing();
+        call.video = true;
+        let mut pipe = pipeline_with_a_running_camera();
+        // Two seconds ago nothing had been sent; since then 700 kbit/s has.
+        let earlier = Instant::now() - std::time::Duration::from_secs(2);
+        let nothing_yet = crate::video_rate::PeerReceiving {
+            bytes: 0,
+            bitrate: 0,
+        };
+        assert_eq!(pipe.rate.on_peer_receiving(nothing_yet, earlier), None);
+        pipe.rate_share.note_sent(175_000);
+        call.video_pipe = Some(pipe);
+        let rate = |call: &Call| call.video_pipe.as_ref().expect("video").rate().bitrate;
+        assert_eq!(call.media(&report(true)), None);
+        assert!(
+            rate(&call) >= crate::video_rate::START_BITRATE,
+            "not about our video alone: read only for its clean loss"
+        );
+        assert_eq!(call.media(&report(false)), None, "nothing for the screen");
+        assert_eq!(rate(&call), 360_000);
     }
 
     #[test]
