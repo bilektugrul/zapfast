@@ -28,13 +28,30 @@ Back up the archive if you need its history. WhatsApp sends only recent
 history to a new device, although ZapFast can request some older messages from
 the phone. Clearing the media cache makes ZapFast download attachments again.
 Expired attachments may still be available through the phone.
+A download is reported as complete only after its local path is recorded in
+the archive. If that write fails, the attachment shows a failure instead;
+the downloaded file is kept in its destination.
 **Settings > Files > Storage used** shows how much space the account on screen
 has in its media cache, split into images, videos and GIFs, stickers, and other
 files. **Clear…** there deletes that account's cached attachments after asking:
 its messages, its other caches, and the other accounts' files stay, and so do
 files in a download folder you chose.
 **Settings > Files > Change…** sends new downloads to another folder, leaving
-earlier ones in place. There, documents keep the name they were sent with; a
+earlier ones in place. New downloads use one fixed layout inside that folder:
+`<account>/<chat name>/file`, where the account folder is the account's phone
+number, such as `+15550001111` (`Account 1` until the number is known). Chat
+names stay readable, with filesystem-unsafe characters replaced and long names
+shortened. When two chats of one account would share a folder, the first keeps
+it and the others become `Name (2)`, `Name (3)`, and so on; each chat keeps its
+folder. New downloads use the current name; existing files are not moved.
+The downloaded file itself goes there, without a second copy in the cache.
+If the destination is unavailable, downloads fall back to the account's normal
+cache as before. This also applies when the folder cannot accept new files or
+publishing the downloaded file fails. Restarting removes unfinished downloads
+from that account's chat folders, without following linked folders.
+If an account or chat folder is a symbolic link, new downloads use the cache
+instead.
+Documents keep the name they were sent with; a
 file already in the folder is never replaced, and the download becomes
 `name (1).pdf`, `name (2).pdf`, and so on. Characters a file system refuses
 become `_`.
@@ -144,9 +161,15 @@ name or description, in the interface language or in English.
   active ones (never channels). It sends at most one request every twenty
   seconds, and only while no other history request is waiting. Each chat is
   asked for at most five pages each time ZapFast runs, and a chat the phone
-  does not answer goes to the back of the queue. Pages fetched this way go into
-  the archive without moving the view. A chat the phone says has nothing older
-  is not asked again.
+  does not answer goes to the back of the queue. Unanswered requests back off
+  for that chat only; other chats keep the normal twenty-second gap. After
+  three unanswered requests in a row, that chat's background recovery pauses
+  until one of those requests gets a late reply, or ZapFast reconnects or
+  restarts. This does not mark history complete or prevent manual requests.
+  A matched background reply resets that chat's timeout count, even if late.
+  Requests that cannot be sent still back off the whole account. Pages fetched
+  this way go into the archive without moving the view. A chat the phone says
+  has nothing older is not asked again.
 - **Keep chats archived**: on by default. When off, a new message, received or
   sent, brings an archived chat back to the list. Applies to all accounts here
   whose phone has not sent its own **Keep chats archived**; once a phone has,
@@ -161,7 +184,8 @@ name or description, in the interface language or in English.
 **Notifications**
 
 - **Desktop notifications**: for chats you are not looking at. Muted chats stay
-  quiet.
+  quiet. The bell beside each number in the account switcher turns the same
+  setting off and on for that number without switching to it.
 - **Show message content in notifications**: on by default. When off, every
   notification says only "New message" from ZapFast, without the chat, the
   sender, the text, or a picture, as behind the app lock, and plays only the

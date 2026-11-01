@@ -128,7 +128,8 @@ by sender, time, and a short summary.
 **Development builds** can star messages. Right-click a message and choose
 **Star**; once WhatsApp confirms it, a small star shows beside the message's
 time. Stars made on your phone or another linked device show up here too, and
-the other way round. The star near the foot of the rail on the left of the chat list, above
+the other way round. Stars made before your copy of ZapFast followed them are
+read from the phone once, the next time it connects. The star near the foot of the rail on the left of the chat list, above
 **Archived** and **Settings**, opens
 **Starred**, which lists every starred message, newest star first, with its
 chat's name and when it was starred. Text shows as written; a photo, video,
@@ -240,6 +241,12 @@ instead. The files you select there go as documents with their own name and
 bytes, pictures included, and show as files above the composer until you send
 them.
 
+Videos go as playable video messages only when they are MP4. WhatsApp does
+not deliver a video message in another format, and ZapFast does not convert
+videos, so a QuickTime `.mov`, WebM, MKV, or AVI file goes as a document
+instead and arrives as the original file. Audio works the same way: MP3, M4A,
+AAC, AMR, and OGG go as audio messages, other formats as documents.
+
 Staged attachments stay with their chat, along with their caption and reply,
 when you switch chats or accounts, and come back when you return. Unlike text
 drafts, they are kept only while ZapFast runs. A refused attachment send goes
@@ -256,7 +263,10 @@ opens over the window with the region to keep marked, and you can drag that
 region by its edges and corners or move it whole. **Turn left** and **Turn
 right** turn the picture a quarter at a time, and **Reset** puts it back the way
 it started. Press Enter or click the check to keep the crop, or Escape or the
-close button to leave the picture as it was.
+close button to leave the picture as it was. Opened from the keyboard, the
+cropper puts focus on the check (**Keep this crop**), Tab moves between its
+buttons, and Enter or Space presses the focused one, so Enter on the close
+button cancels. The region itself moves and resizes with the pointer only.
 
 Keeping a crop does not change the file you picked. ZapFast writes the cropped
 picture beside its other media and sends that one, keeping any see-through
@@ -452,7 +462,12 @@ the speed of the other chats again. When a voice message ends, playback carries 
 voice messages right after it that you have not heard yet, as on the phone;
 any other message ends the run. The speaker's pitch stays the same at every
 speed. The first play sends
-a played receipt. When the composer is empty, the send button becomes a
+a played receipt, so your phone marks the voice message as heard. With read
+receipts off in your account privacy, the receipt goes only to your own
+devices and the sender is not told. With **Send read receipts** off in
+ZapFast's settings, no played receipt is sent. A voice message you have not
+heard yet shows a dot beside its length; it goes away once you play it here or
+on another device. When the composer is empty, the send button becomes a
 microphone. The light beside the time turns red, and the time starts, once the
 microphone delivers sound: one the system had put to sleep can take a moment to
 wake, and anything said before then is not recorded. Press Enter or the send
@@ -615,8 +630,9 @@ Click a message result to jump to it, or a contact to start a chat. Use
 `Alt+↑/↓`, or `Ctrl+Shift+[` and `Ctrl+Shift+]` as in WhatsApp, to switch chats
 without leaving the composer (Command instead of Ctrl on macOS), and
 `Ctrl+1` through `Ctrl+9` to open the chat at that position in the list. Within an open
-chat, `PgUp`/`PgDn` scroll by about a page, and `Home`/`End` jump to the top or
-the newest message (when the input is empty).
+chat, `PgUp`/`PgDn` scroll by about a page, and `Home`/`End` (or `Ctrl+End`)
+jump to the top or the newest message when the input is empty. With text in
+the input, they move the text cursor as in any editor.
 
 With a mouse that has them, the **Back** and **Forward** side buttons step
 through the places you have visited, as in a browser: between chats, and
@@ -665,11 +681,14 @@ appears while the pointer is over the row. The label row scrolls the same way.
 
 Right-click a chat to pin, favorite, archive, mark as unread, or mute it for
 eight hours, one week, or indefinitely. These changes also apply on your
-phone. **Delete chat** in the same menu and **Clear chat** in the chat
-header's menu need a connection: the phone acts first, and the chat leaves
-this computer once it confirms. Groups and channels can be left from the same
-menu, keeping their history here. `Ctrl+E` (Command+E on macOS) archives the
-open chat, or unarchives it from **Archived**, as in WhatsApp.
+phone. **Clear chat** is in this menu and in the chat header's menu; it needs a
+connection and asks first. It clears messages on this computer and your phone,
+removes cached media from this computer, and keeps the chat. Media saved in
+your configured download folder stays there. **Delete chat** in
+the same menu also needs a connection and confirmation. Groups and channels
+can be left from the same menu, keeping their history here. `Ctrl+E`
+(Command+E on macOS) archives the open chat, or unarchives it from
+**Archived**, as in WhatsApp.
 
 ZapFast follows your phone's **Keep chats archived** (in WhatsApp's chat
 settings): with it off, a new message, received or sent, brings an archived
@@ -780,7 +799,6 @@ local code to open
 them; the first time, ZapFast offers to set one up. The code is separate from
 your phone's and adds no encryption beyond the encrypted message archive.
 Leaving the tab, changing the code, or closing the window hides them again.
-Locked chats are read-only in ZapFast for now.
 
 ## Labels
 
@@ -849,6 +867,9 @@ window is open behind others also highlights ZapFast in the taskbar until you
 switch to it. GNOME and Hyprland get no highlight: GNOME would show a second
 notice, and Hyprland can bring the window to the front instead. Muted chats do not send notifications, and
 archived chats stay quiet while they remain archived. You can change both settings.
+With several numbers linked, the bell beside a number in the account switcher
+mutes all of that number's notifications while it stays connected, and leaves
+its unread chats out of the app icon's badge, as a muted chat's are.
 To keep messages off the screen, turn off **Show message content in
 notifications** in Settings: notifications then say only "New message".
 To hear less from busy chats, set **Limit repeat notifications** in
@@ -864,3 +885,44 @@ shortcuts.
 ZapFast announces confirmations, errors, connection changes and history loading
 through the screen reader without moving focus. While the app is locked, only
 connection and history changes are announced.
+
+Each message, or album, is exposed as one item that reads its sender, text,
+time and delivery status, then any quote, forward, edit and reactions; the
+first message of a day starts with the day and the first unread one with
+Unread.
+
+The messages form one list, named for the chat, such as "Messages with Ada" or
+"Messages in Rust Berlin", and each message, or album, reports its position in
+it. The list is a single Tab stop: Alt+2 (Control+2 on macOS) also moves there.
+In the list, Up and Down move one item, Home and End go to the oldest loaded
+and the newest message, and PgUp and PgDn move about a screen; Home on the
+oldest loaded message loads older history. The current message stays put when
+new messages arrive, and follows when ZapFast itself takes you to a message:
+the next voice message playing on, a quoted message, or a search result. After
+keyboard navigation it is outlined like any other focused control.
+
+Shift+F10 opens the current message's menu with focus on its first item; Tab,
+Shift+Tab, Up and Down move through the menu, and Escape closes it and returns
+to the list. The Applications key does not work yet: egui does not report it.
+In this menu, as in any other, typing a letter moves to the next item whose
+name starts with it without choosing it, and the same letter again moves on.
+Opened from the keyboard, the menu also lists a card's buttons, so none of them
+needs the pointer, and what is about the message rather than in it: going to
+the replied message and the sender's info in a group. The right-click menu is
+unchanged. In the list, R replies to the current message and moves to the
+message input, E reacts to it, C copies its text (or a downloaded picture), F
+forwards it, G goes to the message it replies to, Delete (on a Mac, Delete or
+Fn+Delete) asks to delete it for you, and Shift+Delete asks to delete it for
+everyone, with the same dialog as the menu, when that is allowed; otherwise it
+says why.
+These keys wait while the chat selects messages. A call in the chat has only a
+menu to call back, which Space and Enter open too.
+
+In the chat view, Tab moves through the message input and its buttons, phone
+numbers in messages, chat search, the chat info panel, the message list, the
+rail, the chat list's header, search and the chat filters, then returns to the
+input. Shift+Tab goes back; hidden controls are skipped. Single messages,
+reactions and chat rows are not stops. The React and Reply buttons that
+appear beside a hovered message are for the pointer only; keyboard and
+screen-reader users reach both from the message menu. Alt+Up/Down switches
+conversations.

@@ -984,8 +984,11 @@ impl Archive {
             return Ok(None);
         };
         media.path = path.map(Path::to_path_buf);
-        self.set_content(chat, id, &message.content, message.edited)?;
-        Ok(Some(message))
+        if self.set_content(chat, id, &message.content, message.edited)? {
+            Ok(Some(message))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Keeps the download keys of a motion photo's clip and marks its photo.
@@ -1023,15 +1026,16 @@ impl Archive {
             .optional()
     }
 
-    pub fn put_motion_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<()> {
+    /// Returns whether the photo's updated path was actually written.
+    pub fn put_motion_path(&self, chat: &str, id: &str, path: Option<&Path>) -> Result<bool> {
         let Some(mut message) = self.message(chat, id)? else {
-            return Ok(());
+            return Ok(false);
         };
         if let Content::Image { motion, .. } = &mut message.content {
             motion.get_or_insert_default().path = path.map(Path::to_path_buf);
-            self.set_content(chat, id, &message.content, message.edited)?;
+            return self.set_content(chat, id, &message.content, message.edited);
         }
-        Ok(())
+        Ok(false)
     }
 
     /// Returns all recorded motion clip paths.
@@ -1514,6 +1518,12 @@ impl Archive {
             searched_message,
         )?;
         rows.collect()
+    }
+
+    /// Runs `sql` on the archive, for tests that need a row it cannot read.
+    #[cfg(test)]
+    pub(crate) fn execute_for_tests(&self, sql: &str) {
+        self.connection.execute_batch(sql).unwrap();
     }
 
     /// Returns messages from `from` through `before`, ascending and limited.
@@ -2325,7 +2335,16 @@ impl Archive {
         Ok(true)
     }
 
-    /// Advances outgoing messages through `timestamp` to `status` and returns changed ids.
+    /// Marks an incoming message as played and returns whether it was not yet.
+    pub fn mark_played(&self, chat: &str, id: &str) -> Result<bool> {
+        let changed = self.connection.execute(
+            "UPDATE messages SET status = ?3 WHERE chat = ?1 AND id = ?2 AND from_me = 0 AND status < ?3",
+            params![chat, id, status_rank(Delivery::Played)],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Advances acknowledged outgoing messages through `timestamp` to `status` and returns changed ids.
     pub fn advance_statuses(
         &self,
         chat: &str,
@@ -2334,24 +2353,25 @@ impl Archive {
         at: i64,
     ) -> Result<Vec<String>> {
         let rank = status_rank(status);
+        let sent = status_rank(Delivery::Sent);
         let mut statement = self.connection.prepare(
-            "SELECT id FROM messages WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status > 0 AND status < ?3",
+            "SELECT id FROM messages WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status >= ?4 AND status < ?3",
         )?;
         let ids: Vec<String> = statement
-            .query_map(params![chat, up_to, rank], |row| row.get(0))?
+            .query_map(params![chat, up_to, rank, sent], |row| row.get(0))?
             .collect::<Result<_>>()?;
         if let Some(column) = stamp_column(status) {
             self.connection.execute(
                 &format!(
                     "UPDATE messages SET status = ?3, {column} = COALESCE({column}, ?4)
-                     WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status > 0 AND status < ?3"
+                     WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status >= ?5 AND status < ?3"
                 ),
-                params![chat, up_to, rank, at],
+                params![chat, up_to, rank, at, sent],
             )?;
         } else {
             self.connection.execute(
-                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status > 0 AND status < ?3",
-                params![chat, up_to, rank],
+                "UPDATE messages SET status = ?3 WHERE chat = ?1 AND from_me = 1 AND timestamp <= ?2 AND status >= ?4 AND status < ?3",
+                params![chat, up_to, rank, sent],
             )?;
         }
         Ok(ids)
@@ -4570,15 +4590,16 @@ pub(crate) mod tests {
         assert_eq!(stored.reactions[0].sender, "3@s.whatsapp.net");
     }
 
+    /// A cumulative receipt advances earlier acknowledged sends, preserving later and incoming rows.
     #[test]
     fn a_read_receipt_covers_everything_before_it() {
         let archive = Archive::in_memory().expect("opens");
         let chat = "1@s.whatsapp.net";
         archive.ensure_chat(chat, "A").expect("chat");
         for (id, timestamp) in [("m1", 100), ("m2", 200), ("m3", 300)] {
-            archive
-                .insert_message(&message(chat, id, timestamp, true), None)
-                .expect("insert");
+            let mut sent = message(chat, id, timestamp, true);
+            sent.status = Delivery::Sent;
+            archive.insert_message(&sent, None).expect("insert");
         }
         archive
             .insert_message(&message(chat, "theirs", 250, false), None)
@@ -4595,10 +4616,58 @@ pub(crate) mod tests {
                 Delivery::Read,
                 Delivery::Read,
                 Delivery::None,
-                Delivery::Pending
+                Delivery::Sent
             ]
         );
         assert_eq!(messages[0].read_at, Some(400));
+    }
+
+    /// A receipt for a later send is no proof that a still-pending send went out.
+    #[test]
+    fn later_receipts_leave_unacknowledged_sends_and_other_chats_alone() {
+        for receipt in [Delivery::Delivered, Delivery::Read, Delivery::Played] {
+            let archive = Archive::in_memory().unwrap();
+            let chat = "1@s.whatsapp.net";
+            let other = "2@s.whatsapp.net";
+            archive.ensure_chat(chat, "Fixture").unwrap();
+            archive.ensure_chat(other, "Other fixture").unwrap();
+            for (id, status) in [
+                ("pending", Delivery::Pending),
+                ("failed", Delivery::Failed),
+                ("sent", Delivery::Sent),
+            ] {
+                let mut row = message(chat, id, 100, true);
+                row.status = status;
+                archive.insert_message(&row, None).unwrap();
+            }
+            let mut other_row = message(other, "other", 100, true);
+            other_row.status = Delivery::Sent;
+            archive.insert_message(&other_row, None).unwrap();
+            assert_eq!(
+                archive.advance_statuses(chat, 200, receipt, 300).unwrap(),
+                ["sent"]
+            );
+            for (id, expected) in [("pending", Delivery::Pending), ("failed", Delivery::Failed)] {
+                let row = archive.message(chat, id).unwrap().unwrap();
+                assert_eq!(row.status, expected);
+                assert_eq!(row.delivered_at, None);
+                assert_eq!(row.read_at, None);
+            }
+            assert_eq!(
+                archive.message(chat, "sent").unwrap().unwrap().status,
+                receipt
+            );
+            assert_eq!(
+                archive.message(other, "other").unwrap().unwrap().status,
+                Delivery::Sent
+            );
+            assert!(
+                archive
+                    .advance_statuses(chat, 200, Delivery::Delivered, 400)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
     }
 
     #[test]
@@ -5155,6 +5224,61 @@ pub(crate) mod tests {
             assert!(archive.read_through(chat).unwrap().is_none());
         }
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A statement that succeeds without changing a row cannot confirm either media path.
+    #[test]
+    fn media_path_updates_must_actually_write_the_row() {
+        let archive = Archive::in_memory().unwrap();
+        let chat = "fixture@s.whatsapp.net";
+        archive.ensure_chat(chat, "Fixture").unwrap();
+        let mut picture = message(chat, "picture", 100, false);
+        picture.content = Content::Image {
+            caption: None,
+            motion: Some(crate::model::Motion::default()),
+            media: crate::model::Media {
+                mime: "image/jpeg".into(),
+                size: 7,
+                width: None,
+                height: None,
+                album: None,
+                path: None,
+                state: Default::default(),
+            },
+        };
+        archive.insert_message(&picture, None).unwrap();
+        archive.connection.execute_batch("CREATE TRIGGER ignore_media_paths BEFORE UPDATE OF content ON messages BEGIN SELECT RAISE(IGNORE); END;").unwrap();
+        let path = Path::new("synthetic/download.jpg");
+        assert!(
+            archive
+                .put_media_path_at(chat, "picture", None, Some(path))
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !archive
+                .put_motion_path(chat, "picture", Some(path))
+                .unwrap()
+        );
+        assert_eq!(
+            archive.message(chat, "picture").unwrap().unwrap().content,
+            picture.content
+        );
+        archive
+            .connection
+            .execute_batch("DROP TRIGGER ignore_media_paths")
+            .unwrap();
+        assert!(
+            archive
+                .put_media_path_at(chat, "picture", None, Some(path))
+                .unwrap()
+                .is_some()
+        );
+        assert!(
+            archive
+                .put_motion_path(chat, "picture", Some(path))
+                .unwrap()
+        );
     }
 
     /// Checks that persisting a downloaded path updates the attachment content stored in the archive.

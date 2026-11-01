@@ -516,6 +516,11 @@ pub enum Command {
     FirstNamesRecovered {
         complete: bool,
     },
+    /// Internal: the one-time replay of the phone's stars, for those made
+    /// before ZapFast followed them, finished.
+    StarsRecovered {
+        complete: bool,
+    },
     /// Internal: a favorite from the phone finished downloading.
     FavoriteFetched {
         hash: String,
@@ -1141,6 +1146,14 @@ pub enum Event {
         messages: Vec<Message>,
         older: bool,
         complete: bool,
+    },
+    /// History toward a message (`Command::LoadUntil`) that could not be
+    /// read, and why. It ends the chat's wait for older history as an empty
+    /// older page does, and is one event so that the replied-message jump
+    /// waiting on it says this error alone, never "not found" before it.
+    HistoryUnavailable {
+        chat: ChatId,
+        error: String,
     },
     MessageUpdated(Box<Message>),
     /// The account's media cache as measured, `None` when it could not be
