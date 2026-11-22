@@ -52,6 +52,10 @@ pub fn line(
     max_rows: usize,
 ) -> Line {
     let single = text.lines().next().unwrap_or_default();
+    let single = single
+        .char_indices()
+        .nth(512)
+        .map_or(single, |(end, _)| &single[..end]);
     if max_rows == 1 && single.chars().any(bidi::is_strong_rtl) {
         return rtl_line(ui, text, single, font, color, width);
     }

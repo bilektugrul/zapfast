@@ -1846,6 +1846,7 @@ fn composer(app: &mut App, ui: &mut egui::Ui, chat: &Chat, review_send: Option<b
                                     .filter(|range| !range.is_empty());
                                 let mut output = egui::TextEdit::multiline(&mut app.composer)
                                     .id(id)
+                                    .char_limit(65_536)
                                     .frame(Frame::NONE)
                                     .margin(Margin::ZERO)
                                     .hint_text(
@@ -6111,7 +6112,8 @@ fn natural_text_width(ui: &egui::Ui, view: &View<'_>, message: &Message, cap: f3
         link: palette.link,
         mention: palette.accent,
     };
-    let laid = markup::layout(ui, text, &mentions_of(view, message), &style, cap);
+    let text = shown_text(ui.ctx(), view, message, text);
+    let laid = markup::layout(ui, &text, &mentions_of(view, message), &style, cap);
     let widest = laid
         .galley
         .rows
@@ -9647,6 +9649,31 @@ fn interactive_buttons(
     ui.spacing_mut().item_spacing.y = spacing;
 }
 
+/// Characters of a long message shown at first, and added by each Read more.
+const READ_MORE_STEP: usize = 4096;
+/// Most characters one bubble lays out, however far it is expanded.
+const READ_MORE_MAX: usize = 32_768;
+
+fn read_more_id(view: &View<'_>, message: &Message) -> egui::Id {
+    bubble_id(&view.chat.id, &message.id).with("read-more")
+}
+
+/// The start of `text` a bubble shows, cut with an ellipsis when it is longer.
+fn shown_text<'a>(
+    ctx: &egui::Context,
+    view: &View<'_>,
+    message: &Message,
+    text: &'a str,
+) -> std::borrow::Cow<'a, str> {
+    let limit = ctx
+        .data(|data| data.get_temp::<usize>(read_more_id(view, message)))
+        .unwrap_or(READ_MORE_STEP);
+    match text.char_indices().nth(limit) {
+        Some((end, _)) => format!("{}…", &text[..end]).into(),
+        None => text.into(),
+    }
+}
+
 /// Draws formatted message text. `reserve` leaves footer space on the last
 /// line. `span` sets a minimum left-aligned row width for text below cards.
 #[allow(clippy::too_many_arguments)]
@@ -9669,6 +9696,9 @@ fn rich_body(
         link: palette.link,
         mention: palette.accent,
     };
+    let shown = shown_text(ui.ctx(), view, message, text);
+    let cut = matches!(shown, std::borrow::Cow::Owned(_));
+    let text = shown.as_ref();
     let laid = markup::layout(ui, text, &mentions, &style, width);
     let rtl = crate::bidi::message_rtl(text);
     let last_row = laid.galley.rows.last().map_or(0.0, |row| row.row.size.x);
@@ -9899,6 +9929,26 @@ fn rich_body(
             if !url.starts_with("tel:") && response.clicked() {
                 actions.push(Action::OpenUrl(url.to_owned()));
             }
+        }
+    }
+    if cut {
+        let id = read_more_id(view, message);
+        let limit = ui
+            .ctx()
+            .data(|data| data.get_temp::<usize>(id))
+            .unwrap_or(READ_MORE_STEP);
+        if limit < READ_MORE_MAX
+            && theme::link(
+                ui,
+                crate::i18n::gettext(view.locale, "Read more"),
+                theme::regular(BODY_SIZE),
+                palette.link,
+            )
+            .clicked()
+        {
+            ui.ctx().data_mut(|data| {
+                data.insert_temp(id, (limit + READ_MORE_STEP).min(READ_MORE_MAX));
+            });
         }
     }
     inline.map(|reserve| {
